@@ -70,13 +70,11 @@ class BacktestEngine:
             implied_prob = self.simulator.simulate_implied_prob(candles, global_idx, rng)
             orderbook = self.simulator.simulate_orderbook(implied_prob, rng)
 
-            # Use same vol estimate as the simulator so edge comes from
-            # model signal, not vol-window mismatch
-            vol_15m = self.simulator.estimate_vol(candles, global_idx)
-
+            # Calibrate vol from market bracket price so edge comes from
+            # model signal, not vol mismatch
             model_prob = self.ensemble.fair_value_model.predict(window, 0.0)
             bracket_prob = estimate_bracket_prob(
-                current_price, bracket_low, bracket_high, model_prob, vol_15m,
+                current_price, bracket_low, bracket_high, model_prob, implied_prob,
             )
 
             market_data = {

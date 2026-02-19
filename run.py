@@ -8,8 +8,6 @@ import sys
 import time
 from datetime import datetime, timezone
 
-import numpy as np
-
 from kalshi_trader.config import load_config
 from kalshi_trader.dashboard.cli import Dashboard
 from kalshi_trader.data.binance import BinanceClient
@@ -241,11 +239,12 @@ class TradingSystem:
 
     async def _evaluate_and_trade(self):
         """Run ensemble strategy and place trade if warranted."""
-        # Duplicate trade guard: only one trade per 15-min window
+        # Duplicate evaluation guard: only evaluate once per 15-min window
         utc_now = datetime.now(timezone.utc)
         window_id = utc_now.hour * 4 + utc_now.minute // 15
         if window_id == self._last_trade_window:
             return
+        self._last_trade_window = window_id
 
         if self._candles is None or self._candles.empty:
             return
@@ -264,17 +263,7 @@ class TradingSystem:
             yes_ask = self._current_market.get("yes_ask", 50)
             implied_prob = (yes_bid + yes_ask) / 200  # midpoint in [0,1]
 
-        # Compute 15-min volatility from recent candle returns
-        vol_15m = 0.003  # fallback
-        if len(self._candles) >= 20:
-            closes = self._candles["close"].values[-21:]
-            returns = np.diff(closes) / closes[:-1]
-            if len(returns) >= 2:
-                vol_15m = float(np.std(returns))
-                if vol_15m <= 0:
-                    vol_15m = 0.003
-
-        # Compute bracket probability if we have bracket bounds
+        # Compute bracket probability calibrated from market price
         bracket_prob = None
         if self._current_bracket and self._btc_price > 0:
             model_prob = self.ensemble.fair_value_model.predict(self._candles, self._funding_rate)
@@ -283,11 +272,11 @@ class TradingSystem:
                 self._current_bracket[0],
                 self._current_bracket[1],
                 model_prob,
-                vol_15m,
+                implied_prob,
             )
             logger.info(
                 f"Bracket prob: {bracket_prob:.4f} | market implied: {implied_prob:.4f} | "
-                f"model P(up): {model_prob:.4f} | vol_15m: {vol_15m:.5f} | "
+                f"model P(up): {model_prob:.4f} | edge: {bracket_prob - implied_prob:.4f} | "
                 f"bracket: [{self._current_bracket[0]:,.0f}-{self._current_bracket[1]:,.0f}]"
             )
 
@@ -332,7 +321,6 @@ class TradingSystem:
         )
 
         if order and "error" not in order:
-            self._last_trade_window = window_id
             self.trade_logger.log_trade(
                 ticker, result.side, price_cents, result.contracts,
                 "ensemble", result.edge, result.ensemble_prob, implied_prob,
