@@ -1,0 +1,46 @@
+mode: paper  # paper | live
+
+kalshi:
+  base_url: "https://demo-api.kalshi.co/trade-api/v2"
+  live_url: "https://api.elections.kalshi.com/trade-api/v2"
+  event_ticker: "KXBTC"       # series prefix — system finds nearest expiring event
+  orderbook_depth: 10
+  rate_limit_reads: 20
+  rate_limit_writes: 10
+
+binance:
+  base_url: "https://api.binance.us"
+  futures_url: "https://fapi.binance.com"
+  symbol: "BTCUSDT"
+  interval: "15m"
+
+strategy:
+  edge_threshold: 0.001       # minimum edge to trade (0.1%)
+  kelly_fraction: 0.25        # fractional Kelly multiplier
+  momentum_lookback: 4        # candles for momentum (all must agree)
+  mean_reversion_threshold: 0.004  # 0.4% move threshold
+  vol_regime_window: 20       # candles for vol regime
+  funding_weight: 0.1         # funding rate signal weight
+  min_agreeing_signals: 1     # require model + 1 confirming strategy
+  active_strategies:
+    - momentum
+    - mean_reversion
+    - orderbook_imbalance
+    - funding_rate
+
+risk:
+  max_position_size: 50       # $ per trade
+  max_total_exposure: 200     # $ total
+  max_daily_loss: 100         # $ daily loss limit
+  cancel_before_expiry_sec: 120  # cancel open orders 2 min before expiry
+
+polling:
+  binance_interval_sec: 10
+  kalshi_interval_sec: 15
+
+database:
+  path: "data/trader.db"
+
+logging:
+  level: "INFO"
+  trade_csv: "data/trades.csv"
