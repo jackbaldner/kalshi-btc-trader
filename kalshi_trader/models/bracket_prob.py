@@ -116,3 +116,42 @@ def estimate_bracket_prob(
 
     prob = norm.cdf(bracket_high, mu, sigma) - norm.cdf(bracket_low, mu, sigma)
     return float(max(0.0, min(1.0, prob)))
+
+
+def estimate_bracket_prob_from_vol(
+    current_price: float,
+    bracket_low: float,
+    bracket_high: float,
+    predicted_vol: float,
+    model_p_up: float = 0.5,
+) -> float:
+    """Estimate bracket probability using our predicted volatility.
+
+    Unlike estimate_bracket_prob() which calibrates from market price,
+    this uses our own vol prediction. If predicted_vol < implied_vol,
+    we'll get a higher bracket prob → positive edge → buy YES.
+
+    Args:
+        current_price: Current BTC spot price.
+        bracket_low: Lower bound of the bracket.
+        bracket_high: Upper bound of the bracket.
+        predicted_vol: Our predicted next-candle vol (absolute return).
+        model_p_up: Optional directional lean from P(up) model.
+
+    Returns:
+        Probability in [0, 1] that price lands in the bracket.
+    """
+    if predicted_vol <= 0:
+        predicted_vol = 0.003
+
+    # Small directional drift from P(up) model
+    drift = norm.ppf(max(0.01, min(0.99, model_p_up))) * predicted_vol
+
+    mu = current_price * (1 + drift)
+    sigma = current_price * predicted_vol
+
+    if sigma <= 0:
+        return 0.5
+
+    prob = norm.cdf(bracket_high, mu, sigma) - norm.cdf(bracket_low, mu, sigma)
+    return float(max(0.0, min(1.0, prob)))

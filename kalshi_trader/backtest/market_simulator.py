@@ -26,7 +26,7 @@ class MarketSimulator:
     # approaching 1.0 during low-vol stretches.
     MIN_VOL = 0.003
 
-    def __init__(self, noise_std: float = 0.08, lookback: int = 20, efficiency: float = 0.3,
+    def __init__(self, noise_std: float = 0.08, lookback: int = 20, efficiency: float = 0.05,
                  bracket_width: float = 500.0):
         self.noise_std = noise_std
         self.lookback = lookback

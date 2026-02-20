@@ -15,7 +15,8 @@ binance:
   interval: "15m"
 
 strategy:
-  edge_threshold: 0.001       # minimum edge to trade (0.1%)
+  edge_threshold: 0.02        # minimum edge to trade (2%)
+  vol_model_lookback: 20       # candles for vol feature computation
   kelly_fraction: 0.25        # fractional Kelly multiplier
   momentum_lookback: 4        # candles for momentum (all must agree)
   mean_reversion_threshold: 0.004  # 0.4% move threshold

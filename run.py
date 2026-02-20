@@ -17,7 +17,12 @@ from kalshi_trader.data.kalshi_mock import KalshiMock
 from kalshi_trader.execution.order_manager import OrderManager
 from kalshi_trader.execution.risk import RiskManager
 from kalshi_trader.execution.trade_logger import TradeLogger
-from kalshi_trader.models.bracket_prob import estimate_bracket_prob, parse_bracket_bounds
+from kalshi_trader.models.bracket_prob import (
+    estimate_bracket_prob_from_vol,
+    implied_vol_from_bracket_price,
+    parse_bracket_bounds,
+)
+from kalshi_trader.models.vol_model import VolModel
 from kalshi_trader.strategies.ensemble import EnsembleStrategy
 
 logger = logging.getLogger(__name__)
@@ -46,6 +51,7 @@ class TradingSystem:
 
         # Strategy
         self.ensemble = EnsembleStrategy(cfg)
+        self.vol_model = VolModel(lookback=cfg["strategy"].get("vol_model_lookback", 20))
 
         # Execution
         self.order_manager = OrderManager(self.kalshi, cfg)
@@ -85,11 +91,12 @@ class TradingSystem:
                 self.db.upsert_candles(fresh)
                 self._candles = self.db.get_candles(limit=500)
 
-        # Train fair value model
+        # Train models
         if len(self._candles) >= 50:
             self.ensemble.fair_value_model.train(self._candles, self._funding_rate)
+            self.vol_model.train(self._candles, self._funding_rate)
             self._trained = True
-            logger.info(f"Fair value model trained on {len(self._candles)} candles")
+            logger.info(f"Models trained on {len(self._candles)} candles")
 
         # Get initial price
         self._btc_price = await self.binance.get_price()
@@ -252,6 +259,7 @@ class TradingSystem:
         if not self._trained:
             if len(self._candles) >= 50:
                 self.ensemble.fair_value_model.train(self._candles, self._funding_rate)
+                self.vol_model.train(self._candles, self._funding_rate)
                 self._trained = True
             else:
                 return
@@ -263,20 +271,32 @@ class TradingSystem:
             yes_ask = self._current_market.get("yes_ask", 50)
             implied_prob = (yes_bid + yes_ask) / 200  # midpoint in [0,1]
 
-        # Compute bracket probability calibrated from market price
+        # Vol-based bracket probability
         bracket_prob = None
+        predicted_vol = None
+        implied_vol = None
         if self._current_bracket and self._btc_price > 0:
             model_prob = self.ensemble.fair_value_model.predict(self._candles, self._funding_rate)
-            bracket_prob = estimate_bracket_prob(
+            raw_pred_vol = self.vol_model.predict(self._candles, self._funding_rate)
+            implied_vol = implied_vol_from_bracket_price(
                 self._btc_price,
                 self._current_bracket[0],
                 self._current_bracket[1],
-                model_prob,
                 implied_prob,
             )
+            predicted_vol = self.vol_model.blend_with_implied(raw_pred_vol, implied_vol)
+            bracket_prob = estimate_bracket_prob_from_vol(
+                self._btc_price,
+                self._current_bracket[0],
+                self._current_bracket[1],
+                predicted_vol,
+                model_prob,
+            )
             logger.info(
-                f"Bracket prob: {bracket_prob:.4f} | market implied: {implied_prob:.4f} | "
-                f"model P(up): {model_prob:.4f} | edge: {bracket_prob - implied_prob:.4f} | "
+                f"Vol: raw={raw_pred_vol:.5f} blended={predicted_vol:.5f} "
+                f"impl={implied_vol:.5f} | "
+                f"bracket_prob={bracket_prob:.4f} mkt={implied_prob:.4f} "
+                f"edge={bracket_prob - implied_prob:.4f} | "
                 f"bracket: [{self._current_bracket[0]:,.0f}-{self._current_bracket[1]:,.0f}]"
             )
 
@@ -285,6 +305,8 @@ class TradingSystem:
             "funding_rate": self._funding_rate,
             "implied_prob": implied_prob,
             "bracket_prob": bracket_prob,
+            "predicted_vol": predicted_vol,
+            "implied_vol": implied_vol,
         }
 
         balance = self.kalshi.get_balance()

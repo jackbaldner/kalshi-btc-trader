@@ -38,6 +38,8 @@ class EnsembleResult:
         self.should_trade: bool = False
         self.signal_count: int = 0
         self.confirming_strategies: list[str] = []
+        self.predicted_vol: float = 0.0
+        self.implied_vol: float = 0.0
 
 
 class EnsembleStrategy:
@@ -122,19 +124,28 @@ class EnsembleStrategy:
         # Market implied probability (bracket price from Kalshi)
         result.implied_prob = market_data.get("implied_prob", 0.5)
 
-        # Bracket-based edge calculation
-        # bracket_prob = our estimate of P(price in bracket) from normal CDF
-        # implied_prob = market's price for that bracket
+        # Vol-based edge: predicted_vol vs implied_vol
+        predicted_vol = market_data.get("predicted_vol")
+        implied_vol = market_data.get("implied_vol")
         bracket_prob = market_data.get("bracket_prob")
 
+        if predicted_vol is not None and implied_vol is not None:
+            result.predicted_vol = predicted_vol
+            result.implied_vol = implied_vol
+
         if bracket_prob is not None:
-            # Bracket mode: compare our bracket probability vs market bracket price
+            # Bracket mode: our bracket prob (from vol prediction) vs market price
             our_p = bracket_prob
             market_p = result.implied_prob
             result.edge = our_p - market_p
 
             if result.edge > 0:
-                result.side = "yes"  # our prob > market → buy yes on this bracket
+                result.side = "yes"  # predicted vol < implied → bracket underpriced
+            elif result.edge < -self.edge_threshold:
+                result.side = "no"   # predicted vol > implied → bracket overpriced
+                result.edge = abs(result.edge)
+                our_p = 1 - bracket_prob
+                market_p = 1 - result.implied_prob
             else:
                 result.should_trade = False
                 return result
@@ -151,7 +162,7 @@ class EnsembleStrategy:
 
             result.edge = our_p - market_p
 
-        if result.edge < self.edge_threshold:
+        if abs(result.edge) < self.edge_threshold:
             result.should_trade = False
             return result
 
@@ -165,8 +176,15 @@ class EnsembleStrategy:
         result.should_trade = result.contracts > 0
 
         if result.should_trade:
+            vol_str = ""
+            if result.predicted_vol > 0 and result.implied_vol > 0:
+                vol_str = (
+                    f"pred_vol={result.predicted_vol:.5f} "
+                    f"impl_vol={result.implied_vol:.5f} "
+                    f"vol_ratio={result.predicted_vol/result.implied_vol:.2f} "
+                )
             logger.info(
-                f"Ensemble: dir={result.direction.value} prob={result.ensemble_prob:.3f} "
+                f"Ensemble: side={result.side} {vol_str}"
                 f"implied={result.implied_prob:.3f} edge={result.edge:.3f} "
                 f"kelly={result.kelly_f:.3f} contracts={result.contracts} "
                 f"confirmed_by={result.confirming_strategies} regime={regime}"
