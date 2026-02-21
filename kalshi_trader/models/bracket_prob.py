@@ -41,6 +41,10 @@ def parse_bracket_bounds(market: dict) -> tuple[float, float] | None:
         if m:
             low = float(m.group(1))
             high = low + 500.0  # standard $500 bracket
+            logger.warning(
+                f"Using hardcoded $500 bracket width for {ticker} — "
+                f"subtitle parse failed, actual width may differ"
+            )
             return (low, high)
 
     return None
@@ -131,6 +135,10 @@ def estimate_bracket_prob_from_vol(
     this uses our own vol prediction. If predicted_vol < implied_vol,
     we'll get a higher bracket prob → positive edge → buy YES.
 
+    Applies a tail-risk adjustment: far-OTM brackets get their probability
+    shrunk toward the market because the normal distribution underestimates
+    tail risk (BTC has fat tails), making far-OTM brackets look falsely cheap.
+
     Args:
         current_price: Current BTC spot price.
         bracket_low: Lower bound of the bracket.
@@ -154,4 +162,29 @@ def estimate_bracket_prob_from_vol(
         return 0.5
 
     prob = norm.cdf(bracket_high, mu, sigma) - norm.cdf(bracket_low, mu, sigma)
-    return float(max(0.0, min(1.0, prob)))
+    prob = float(max(0.0, min(1.0, prob)))
+
+    # Tail-risk adjustment: penalize confidence on far-OTM brackets.
+    # The normal distribution underestimates tail probability for BTC.
+    # For brackets far from current price, shrink our prob estimate toward
+    # a conservative baseline (reduces false edge on cheap OTM brackets).
+    bracket_mid = (bracket_low + bracket_high) / 2
+    distance = abs(bracket_mid - current_price) / current_price  # as fraction
+    # distance_in_sigmas: how many predicted-vol units away is this bracket
+    distance_in_sigmas = distance / max(predicted_vol, 0.0005)
+
+    if distance_in_sigmas > 1.0:
+        # Shrink our prob toward zero for far-out brackets.
+        # At 1 sigma: no penalty. At 2+ sigma: heavy penalty.
+        # trust_factor decays from 1.0 at 1σ to ~0.3 at 3σ
+        trust_factor = 1.0 / (1.0 + 0.5 * (distance_in_sigmas - 1.0))
+        adjusted_prob = prob * trust_factor
+        if adjusted_prob != prob:
+            logger.debug(
+                f"Tail-risk adjustment: bracket [{bracket_low:,.0f}-{bracket_high:,.0f}] "
+                f"distance={distance:.4f} ({distance_in_sigmas:.1f}σ) "
+                f"prob {prob:.4f} -> {adjusted_prob:.4f} (trust={trust_factor:.2f})"
+            )
+        prob = adjusted_prob
+
+    return prob

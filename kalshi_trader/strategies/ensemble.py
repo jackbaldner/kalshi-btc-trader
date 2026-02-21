@@ -5,7 +5,7 @@ import logging
 import pandas as pd
 
 from ..models.fair_value import FairValueModel
-from ..models.kelly import kelly_fraction, size_order
+from ..models.kelly import kelly_fraction, kelly_ramp, size_order
 from .base import Direction, Signal, Strategy
 from .funding_rate import FundingRateStrategy
 from .mean_reversion import MeanReversionStrategy
@@ -55,6 +55,7 @@ class EnsembleStrategy:
         self.cfg = cfg
         self.edge_threshold = cfg["strategy"]["edge_threshold"]
         self.kelly_multiplier = cfg["strategy"]["kelly_fraction"]
+        self.full_kelly_edge = cfg["strategy"].get("full_kelly_edge", 0.05)
         self.max_position = cfg["risk"]["max_position_size"]
         self.min_confirmations = cfg["strategy"].get("min_agreeing_signals", 1)
 
@@ -166,8 +167,9 @@ class EnsembleStrategy:
             result.should_trade = False
             return result
 
-        # Kelly sizing
-        result.kelly_f = kelly_fraction(our_p, market_p, self.kelly_multiplier)
+        # Kelly sizing with edge-based ramp
+        ramp = kelly_ramp(result.edge, self.edge_threshold, self.full_kelly_edge)
+        result.kelly_f = kelly_fraction(our_p, market_p, self.kelly_multiplier * ramp)
         if result.kelly_f <= 0:
             result.should_trade = False
             return result
@@ -186,7 +188,7 @@ class EnsembleStrategy:
             logger.info(
                 f"Ensemble: side={result.side} {vol_str}"
                 f"implied={result.implied_prob:.3f} edge={result.edge:.3f} "
-                f"kelly={result.kelly_f:.3f} contracts={result.contracts} "
+                f"kelly={result.kelly_f:.3f} ramp={ramp:.2f} contracts={result.contracts} "
                 f"confirmed_by={result.confirming_strategies} regime={regime}"
             )
 

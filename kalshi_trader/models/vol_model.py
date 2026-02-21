@@ -143,6 +143,67 @@ class VolModel:
             f"median_actual={median_actual:.5f}, median_pred={median_pred:.5f}"
         )
 
+        # Optimize shrinkage on this data
+        self.optimize_shrinkage(candles, funding_rate)
+
+    def optimize_shrinkage(self, candles: pd.DataFrame, funding_rate: float = 0.0):
+        """Find optimal shrinkage via train/test split.
+
+        Sweeps shrinkage from 0.1 to 1.0 and picks the value that minimizes
+        MAE of blended vol predictions vs actual realized vol on a held-out test set.
+        """
+        if not self._fitted:
+            return
+
+        X = self._compute_features(candles, funding_rate)
+        y = candles["close"].pct_change().shift(-1).abs().values
+
+        valid = ~(np.isnan(X).any(axis=1)) & ~np.isnan(y)
+        valid[-1] = False
+        X = X[valid]
+        y = y[valid]
+
+        if len(X) < 100:
+            logger.warning("Not enough data for shrinkage optimization")
+            return
+
+        # 70/30 train/test split (chronological — no shuffling)
+        split = int(len(X) * 0.7)
+        X_test = X[split:]
+        y_test = y[split:]
+
+        if len(X_test) < 20:
+            logger.warning("Test set too small for shrinkage optimization")
+            return
+
+        X_test_scaled = self.scaler.transform(X_test)
+        raw_preds = self.model.predict(X_test_scaled)
+        raw_preds = np.maximum(raw_preds, 0.0005)
+
+        # Use median predicted vol as a proxy for implied vol in this sweep
+        implied_proxy = float(np.median(y_test))
+
+        results = []
+        for s_int in range(1, 11):
+            s = s_int / 10.0
+            blended = implied_proxy + s * (raw_preds - implied_proxy)
+            blended = np.maximum(blended, 0.0005)
+            mae = float(np.mean(np.abs(y_test - blended)))
+            results.append((s, mae))
+
+        # Log full results table
+        header = "Shrinkage optimization results:"
+        rows = "\n".join(f"  shrinkage={s:.1f}  MAE={mae:.6f}" for s, mae in results)
+        logger.info(f"{header}\n{rows}")
+
+        # Pick the shrinkage with lowest MAE
+        best_s, best_mae = min(results, key=lambda x: x[1])
+        old_s = self.shrinkage
+        self.shrinkage = best_s
+        logger.info(
+            f"Shrinkage optimized: {old_s:.1f} -> {best_s:.1f} (MAE={best_mae:.6f})"
+        )
+
     def predict(self, candles: pd.DataFrame, funding_rate: float = 0.0) -> float:
         """Predict next-candle realized vol (absolute return).
 

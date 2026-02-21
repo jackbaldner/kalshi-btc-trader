@@ -14,9 +14,12 @@ from kalshi_trader.data.binance import BinanceClient
 from kalshi_trader.data.database import Database
 from kalshi_trader.data.kalshi_client import KalshiClient
 from kalshi_trader.data.kalshi_mock import KalshiMock
+from kalshi_trader.data.kalshi_ws import KalshiWebSocket
 from kalshi_trader.execution.order_manager import OrderManager
 from kalshi_trader.execution.risk import RiskManager
 from kalshi_trader.execution.trade_logger import TradeLogger
+import re
+
 from kalshi_trader.models.bracket_prob import (
     estimate_bracket_prob_from_vol,
     implied_vol_from_bracket_price,
@@ -58,8 +61,15 @@ class TradingSystem:
         self.risk = RiskManager(cfg, self.db)
         self.trade_logger = TradeLogger(self.db, cfg["logging"]["trade_csv"])
 
+        # WebSocket for real-time orderbook
+        self.kalshi_ws = KalshiWebSocket(cfg)
+
         # Dashboard
         self.dashboard = Dashboard()
+
+        # Settlement
+        self._settlement_interval = 60  # check every 60 seconds
+        self._last_settlement_check = 0
 
         # State
         self._last_binance_poll = 0
@@ -71,6 +81,8 @@ class TradingSystem:
         self._current_market = None
         self._current_event_ticker = None
         self._current_bracket = None  # (low, high) bounds of selected bracket
+        self._all_brackets = []  # sorted list of (market, (low, high))
+        self._traded_brackets_this_window = set()  # per-bracket dedup within a window
         self._orderbook = None
         self._candles = None
         self._trained = False
@@ -111,8 +123,9 @@ class TradingSystem:
         binance_interval = self.cfg["polling"]["binance_interval_sec"]
         kalshi_interval = self.cfg["polling"]["kalshi_interval_sec"]
 
-        # Start dashboard in background
+        # Start dashboard and WebSocket in background
         dashboard_task = asyncio.create_task(self._dashboard_loop())
+        ws_task = asyncio.create_task(self._ws_loop())
 
         try:
             while self.running:
@@ -128,9 +141,19 @@ class TradingSystem:
                     await self._poll_kalshi()
                     self._last_kalshi_poll = now
 
-                # Check if we're on a 15-min boundary (within 30 sec)
+                # Settle expired trades
+                if now - self._last_settlement_check >= self._settlement_interval:
+                    await self._settle_trades()
+                    self._last_settlement_check = now
+
+                # Trade 2 minutes before the 15-min boundary to beat the crowd
+                # e.g. trade at :13, :28, :43, :58 instead of :00, :15, :30, :45
+                trade_offset = self.cfg["strategy"].get("trade_offset_sec", 120)
                 utc_now = datetime.now(timezone.utc)
-                if utc_now.minute % 15 < 1 and utc_now.second < 30:
+                secs_into_window = (utc_now.minute % 15) * 60 + utc_now.second
+                window_duration = 15 * 60
+                secs_until_boundary = window_duration - secs_into_window
+                if secs_until_boundary <= trade_offset and secs_until_boundary > (trade_offset - 30):
                     await self._evaluate_and_trade()
 
                 await asyncio.sleep(1)
@@ -139,7 +162,21 @@ class TradingSystem:
             pass
         finally:
             dashboard_task.cancel()
+            ws_task.cancel()
             await self._shutdown()
+
+    async def _ws_loop(self):
+        """Run WebSocket orderbook feed. Waits for a market to be selected, then connects."""
+        try:
+            # Wait until we have a market to subscribe to
+            while self.running and not self._current_market:
+                await asyncio.sleep(1)
+
+            if self._current_market:
+                ticker = self._current_market["ticker"]
+                await self.kalshi_ws.connect(ticker)
+        except asyncio.CancelledError:
+            await self.kalshi_ws.close()
 
     async def _poll_binance(self):
         """Fetch latest BTC price and candles."""
@@ -198,7 +235,9 @@ class TradingSystem:
                 logger.warning("Could not parse bracket bounds from any market")
                 self._current_market = markets[0]
                 self._current_bracket = None
+                self._all_brackets = []
             else:
+                self._all_brackets = sorted(parsed, key=lambda mb: mb[1][0])
                 # Prefer the bracket that contains the current BTC price
                 containing = [
                     (m, b) for m, b in parsed
@@ -216,7 +255,19 @@ class TradingSystem:
                     self._current_market, self._current_bracket = nearest
 
             ticker = self._current_market["ticker"]
-            self._orderbook = self.kalshi_reader.get_orderbook(ticker)
+
+            # Use WebSocket orderbook if available and fresh, else REST fallback
+            if self.kalshi_ws.is_ready and self.kalshi_ws.age_seconds < 5:
+                self._orderbook = self.kalshi_ws.orderbook
+            else:
+                self._orderbook = self.kalshi_reader.get_orderbook(ticker)
+
+            # Switch WS subscription if market changed
+            await self.kalshi_ws.switch_market(ticker)
+
+            # Feed real orderbook to mock for realistic fill simulation
+            if hasattr(self.kalshi, "set_live_orderbook"):
+                self.kalshi.set_live_orderbook(self._orderbook)
 
             subtitle = self._current_market.get("subtitle", ticker)
             yes_bid = self._current_market.get("yes_bid", 0)
@@ -245,13 +296,14 @@ class TradingSystem:
             logger.error(f"Kalshi poll error: {e}")
 
     async def _evaluate_and_trade(self):
-        """Run ensemble strategy and place trade if warranted."""
+        """Run ensemble strategy across current bracket ± 2 adjacent brackets."""
         # Duplicate evaluation guard: only evaluate once per 15-min window
         utc_now = datetime.now(timezone.utc)
         window_id = utc_now.hour * 4 + utc_now.minute // 15
         if window_id == self._last_trade_window:
             return
         self._last_trade_window = window_id
+        self._traded_brackets_this_window = set()
 
         if self._candles is None or self._candles.empty:
             return
@@ -264,40 +316,104 @@ class TradingSystem:
             else:
                 return
 
-        # Build market data
-        implied_prob = 0.5
-        if self._current_market:
-            yes_bid = self._current_market.get("yes_bid", 50)
-            yes_ask = self._current_market.get("yes_ask", 50)
-            implied_prob = (yes_bid + yes_ask) / 200  # midpoint in [0,1]
+        if not self._all_brackets:
+            if self._current_market and self._current_bracket:
+                # Fallback: evaluate just the current bracket
+                await self._evaluate_single_bracket(
+                    self._current_market, self._current_bracket, self.kalshi.get_balance(),
+                )
+            return
+
+        # Find index of the bracket containing current price
+        center_idx = None
+        for i, (m, b) in enumerate(self._all_brackets):
+            if b[0] <= self._btc_price < b[1]:
+                center_idx = i
+                break
+
+        if center_idx is None:
+            # Price not in any bracket — find nearest
+            center_idx = min(
+                range(len(self._all_brackets)),
+                key=lambda i: min(abs(self._btc_price - self._all_brackets[i][1][0]),
+                                  abs(self._btc_price - self._all_brackets[i][1][1])),
+            )
+
+        # Evaluate center ± 2 adjacent brackets
+        start_idx = max(0, center_idx - 2)
+        end_idx = min(len(self._all_brackets), center_idx + 3)  # +3 because range is exclusive
+        brackets_to_eval = self._all_brackets[start_idx:end_idx]
+
+        logger.info(
+            f"Evaluating {len(brackets_to_eval)} brackets "
+            f"(indices {start_idx}-{end_idx - 1} of {len(self._all_brackets)}, "
+            f"center={center_idx})"
+        )
+
+        balance = self.kalshi.get_balance()
+        for market, bracket in brackets_to_eval:
+            await self._evaluate_single_bracket(market, bracket, balance)
+            # Refresh balance after each trade so Kelly sizing adapts
+            balance = self.kalshi.get_balance()
+
+    async def _evaluate_single_bracket(self, market: dict, bracket: tuple, balance: float):
+        """Evaluate and potentially trade a single bracket."""
+        ticker = market["ticker"]
+
+        # Per-bracket dedup: check DB for this specific ticker in this window
+        if ticker in self._traded_brackets_this_window:
+            return
+        utc_now = datetime.now(timezone.utc)
+        window_start = utc_now.replace(minute=(utc_now.minute // 15) * 15, second=0, microsecond=0)
+        window_start_ms = int(window_start.timestamp() * 1000)
+        window_end_ms = window_start_ms + 15 * 60 * 1000
+        existing = self.db.conn.execute(
+            "SELECT COUNT(*) as c FROM trades WHERE timestamp >= ? AND timestamp < ? AND ticker = ?",
+            (window_start_ms, window_end_ms, ticker),
+        ).fetchone()
+        if existing["c"] > 0:
+            logger.debug(f"Trade already exists for {ticker} in window {window_start.strftime('%H:%M')}, skipping")
+            return
+
+        # Per-bracket daily limit: avoid overconcentration on one ticker
+        max_daily_per_bracket = self.cfg["risk"].get("max_daily_trades_per_bracket", 4)
+        day_start = utc_now.replace(hour=0, minute=0, second=0, microsecond=0)
+        day_start_ms = int(day_start.timestamp() * 1000)
+        daily_count = self.db.conn.execute(
+            "SELECT COUNT(*) as c FROM trades WHERE timestamp >= ? AND ticker = ?",
+            (day_start_ms, ticker),
+        ).fetchone()
+        if daily_count["c"] >= max_daily_per_bracket:
+            logger.info(
+                f"Daily limit reached for {ticker}: {daily_count['c']}/{max_daily_per_bracket} trades today, skipping"
+            )
+            return
+
+        # Build market data for this bracket
+        yes_bid = market.get("yes_bid", 50)
+        yes_ask = market.get("yes_ask", 50)
+        implied_prob = (yes_bid + yes_ask) / 200  # midpoint in [0,1]
 
         # Vol-based bracket probability
         bracket_prob = None
         predicted_vol = None
         implied_vol = None
-        if self._current_bracket and self._btc_price > 0:
+        if self._btc_price > 0:
             model_prob = self.ensemble.fair_value_model.predict(self._candles, self._funding_rate)
             raw_pred_vol = self.vol_model.predict(self._candles, self._funding_rate)
             implied_vol = implied_vol_from_bracket_price(
-                self._btc_price,
-                self._current_bracket[0],
-                self._current_bracket[1],
-                implied_prob,
+                self._btc_price, bracket[0], bracket[1], implied_prob,
             )
             predicted_vol = self.vol_model.blend_with_implied(raw_pred_vol, implied_vol)
             bracket_prob = estimate_bracket_prob_from_vol(
-                self._btc_price,
-                self._current_bracket[0],
-                self._current_bracket[1],
-                predicted_vol,
-                model_prob,
+                self._btc_price, bracket[0], bracket[1], predicted_vol, model_prob,
             )
             logger.info(
                 f"Vol: raw={raw_pred_vol:.5f} blended={predicted_vol:.5f} "
                 f"impl={implied_vol:.5f} | "
                 f"bracket_prob={bracket_prob:.4f} mkt={implied_prob:.4f} "
                 f"edge={bracket_prob - implied_prob:.4f} | "
-                f"bracket: [{self._current_bracket[0]:,.0f}-{self._current_bracket[1]:,.0f}]"
+                f"bracket: [{bracket[0]:,.0f}-{bracket[1]:,.0f}]"
             )
 
         market_data = {
@@ -309,10 +425,9 @@ class TradingSystem:
             "implied_vol": implied_vol,
         }
 
-        balance = self.kalshi.get_balance()
         result = self.ensemble.evaluate(self._candles, market_data, balance)
 
-        # Update dashboard
+        # Update dashboard with latest evaluation
         self.dashboard.update(
             current_edge=result.edge,
             regime=result.regime,
@@ -320,32 +435,335 @@ class TradingSystem:
         )
 
         if not result.should_trade:
+            logger.info(f"No edge for [{bracket[0]:,.0f}-{bracket[1]:,.0f}] — skipping")
             return
 
-        if not self._current_market:
-            logger.warning("No active market to trade")
+        # Use freshest orderbook available before trading
+        if self.kalshi_ws.is_ready and self.kalshi_ws.age_seconds < 2:
+            fresh_book = self.kalshi_ws.orderbook
+            logger.info(f"Using WebSocket orderbook ({self.kalshi_ws.age_seconds:.1f}s old)")
+        else:
+            try:
+                fresh_book = self.kalshi_reader.get_orderbook(ticker)
+                logger.info(f"Refreshed orderbook via REST for {ticker}")
+            except Exception as e:
+                logger.warning(f"Failed to refresh orderbook: {e}")
+                fresh_book = self._orderbook
+
+        if fresh_book and hasattr(self.kalshi, "set_live_orderbook"):
+            self.kalshi.set_live_orderbook(fresh_book)
+            self._orderbook = fresh_book
+
+        # Smart pricing
+        price_cents, available_depth = self._get_realistic_price(
+            fresh_book or self._orderbook, result.side, result.edge, result.ensemble_prob,
+        )
+        if price_cents is None:
+            logger.info(f"No fillable price with edge for {result.side} on {ticker} — skipping")
             return
 
-        ticker = self._current_market["ticker"]
-        price_cents = int(implied_prob * 100) if result.side == "yes" else int((1 - implied_prob) * 100)
-        price_cents = max(1, min(99, price_cents))
+        order_size = result.contracts
+        if order_size <= 0:
+            return
+
+        logger.info(
+            f"Order plan: {result.side} {order_size}x {ticker} @ {price_cents}c "
+            f"(book has {available_depth}, partial fill OK)"
+        )
 
         # Risk check
-        allowed, reason = self.risk.check_order(result.side, price_cents, result.contracts, balance)
+        allowed, reason = self.risk.check_order(result.side, price_cents, order_size, balance)
         if not allowed:
             logger.info(f"Trade blocked by risk: {reason}")
             return
 
+        # Calculate fill confidence before placing order
+        fill_confidence = self._estimate_fill_confidence(
+            fresh_book or self._orderbook, result.side, price_cents, order_size,
+        )
+
         # Place order
         order = self.order_manager.place_order(
-            ticker, result.side, price_cents, result.contracts,
-            expiry_time_ms=self._current_market.get("close_time"),
+            ticker, result.side, price_cents, order_size,
+            expiry_time_ms=market.get("close_time"),
         )
 
         if order and "error" not in order:
+            filled_count = order.get("count", result.contracts)
+            fill_price = order.get("yes_price", price_cents)
             self.trade_logger.log_trade(
-                ticker, result.side, price_cents, result.contracts,
+                ticker, result.side, fill_price, filled_count,
                 "ensemble", result.edge, result.ensemble_prob, implied_prob,
+                predicted_vol=predicted_vol, implied_vol=implied_vol,
+                fill_confidence=fill_confidence,
+                bracket_low=bracket[0], bracket_high=bracket[1],
+            )
+            self._traded_brackets_this_window.add(ticker)
+            # Update exposure so risk checks work across multi-bracket trades
+            positions = self.kalshi.get_positions()
+            self.risk.update_exposure(positions)
+
+    def _get_realistic_price(self, book: dict, side: str, edge: float,
+                               model_prob: float) -> tuple[int | None, int]:
+        """Determine the best fillable price from the orderbook that still has edge.
+
+        Returns (price_cents, available_depth) or (None, 0) if no viable price.
+        """
+        if not book:
+            return None, 0
+
+        # Get ask levels we'd cross (opposite side bids converted)
+        opposite_side = "no" if side == "yes" else "yes"
+        opposite_bids = book.get(opposite_side, [])
+
+        if not opposite_bids:
+            return None, 0
+
+        # Convert to ask prices, sorted cheapest first
+        ask_levels = sorted(
+            [(100 - p, q) for p, q in opposite_bids],
+            key=lambda x: x[0],
+        )
+
+        # Find the best ask price where we still have edge
+        # Edge = model_prob - price/100 (for YES side)
+        # We'll pay up to the ask as long as edge remains above threshold
+        edge_threshold = self.cfg["strategy"]["edge_threshold"]
+
+        for ask_price, depth in ask_levels:
+            if side == "yes":
+                effective_implied = ask_price / 100.0
+                remaining_edge = model_prob - effective_implied
+            else:
+                effective_implied = (100 - ask_price) / 100.0
+                remaining_edge = (1 - model_prob) - effective_implied
+
+            if remaining_edge >= edge_threshold:
+                # Still have edge at this price — use it
+                # Sum up all depth at this price and cheaper
+                total_depth = sum(q for p, q in ask_levels if p <= ask_price)
+                logger.info(
+                    f"Realistic price: {side} @ {ask_price}c (ask) | "
+                    f"edge_at_ask={remaining_edge:.4f} depth={total_depth}"
+                )
+                return ask_price, total_depth
+
+        # No ask level has enough edge
+        best_ask = ask_levels[0][0] if ask_levels else 0
+        if side == "yes":
+            best_edge = model_prob - best_ask / 100.0
+        else:
+            best_edge = (1 - model_prob) - (100 - best_ask) / 100.0
+        logger.info(
+            f"No edge at any ask: best_ask={best_ask}c edge_at_best={best_edge:.4f} "
+            f"(need {edge_threshold})"
+        )
+        return None, 0
+
+    def _estimate_fill_confidence(self, book: dict, side: str, limit_price: int,
+                                    order_size: int) -> float:
+        """Estimate the probability (0-100%) this order would fill in a live environment.
+
+        Factors:
+        - Depth ratio: how much of the available liquidity we're consuming
+        - Book staleness: how old the orderbook data is
+        - Spread: wider spread = less liquid = lower confidence
+        - Fill completeness: could we even fill the full order in simulation?
+        """
+        if not book:
+            return 10.0  # no book data = very low confidence
+
+        # 1. Depth analysis: walk the book to see available liquidity
+        opposite_side = "no" if side == "yes" else "yes"
+        opposite_bids = book.get(opposite_side, [])
+
+        if not opposite_bids:
+            return 5.0  # no liquidity on the other side
+
+        # Convert to ask levels we'd cross
+        ask_levels = sorted(
+            [(100 - p, q) for p, q in opposite_bids],
+            key=lambda x: x[0],
+        )
+
+        # Total available at or below our limit
+        available = sum(q for price, q in ask_levels if price <= limit_price)
+
+        if available == 0:
+            return 5.0  # nothing available at our price
+
+        # Depth ratio: what fraction of available liquidity are we taking?
+        # Taking <10% = great, >50% = risky (our order would move the market)
+        depth_ratio = order_size / available
+        if depth_ratio <= 0.05:
+            depth_score = 100.0
+        elif depth_ratio <= 0.10:
+            depth_score = 90.0
+        elif depth_ratio <= 0.25:
+            depth_score = 70.0
+        elif depth_ratio <= 0.50:
+            depth_score = 45.0
+        elif depth_ratio <= 1.0:
+            depth_score = 25.0
+        else:
+            depth_score = 10.0  # can't even fill the order
+
+        # 2. Staleness penalty
+        book_age = self.kalshi_ws.age_seconds if self.kalshi_ws.is_ready else 30.0
+        if book_age < 1:
+            staleness_score = 100.0   # real-time WebSocket
+        elif book_age < 3:
+            staleness_score = 90.0    # very fresh
+        elif book_age < 10:
+            staleness_score = 70.0    # acceptable
+        elif book_age < 30:
+            staleness_score = 45.0    # stale
+        else:
+            staleness_score = 20.0    # very stale
+
+        # 3. Spread score
+        same_bids = book.get(side, [])
+        if same_bids and opposite_bids:
+            best_bid = max(p for p, q in same_bids) if same_bids else 0
+            best_ask = min(100 - p for p, q in opposite_bids)
+            spread = best_ask - best_bid
+            if spread <= 2:
+                spread_score = 95.0
+            elif spread <= 5:
+                spread_score = 80.0
+            elif spread <= 10:
+                spread_score = 60.0
+            elif spread <= 20:
+                spread_score = 35.0
+            else:
+                spread_score = 15.0
+        else:
+            spread_score = 20.0
+
+        # 4. Price impact: how many levels do we eat through?
+        levels_consumed = sum(1 for p, q in ask_levels if p <= limit_price and q > 0)
+        total_levels = len(ask_levels)
+        if levels_consumed <= 1:
+            impact_score = 95.0
+        elif levels_consumed <= 2:
+            impact_score = 80.0
+        elif levels_consumed <= 3:
+            impact_score = 60.0
+        else:
+            impact_score = 35.0
+
+        # Weighted composite
+        confidence = (
+            depth_score * 0.35 +
+            staleness_score * 0.30 +
+            spread_score * 0.20 +
+            impact_score * 0.15
+        )
+
+        confidence = max(0.0, min(100.0, confidence))
+
+        logger.info(
+            f"Fill confidence: {confidence:.1f}% "
+            f"(depth={depth_score:.0f} stale={staleness_score:.0f} "
+            f"spread={spread_score:.0f} impact={impact_score:.0f} | "
+            f"available={available} need={order_size} ratio={depth_ratio:.2f} "
+            f"book_age={book_age:.1f}s)"
+        )
+
+        return confidence
+
+    async def _settle_trades(self):
+        """Check unresolved trades and settle any whose 15-min window has expired."""
+        unresolved = self.db.get_unresolved_trades()
+        if not unresolved:
+            return
+
+        now_ms = int(time.time() * 1000)
+        settle_delay_ms = 15 * 60 * 1000  # 15 minutes
+
+        for trade in unresolved:
+            # Only settle after the 15-min window has elapsed
+            if now_ms - trade["timestamp"] < settle_delay_ms:
+                continue
+
+            ticker = trade["ticker"]
+
+            # Determine bracket bounds (priority: stored → cache → API → ticker fallback)
+            bracket_low = trade.get("bracket_low")
+            bracket_high = trade.get("bracket_high")
+
+            if bracket_low is None or bracket_high is None:
+                # Try cached brackets from current polling
+                cached = next(
+                    ((m_, b) for m_, b in self._all_brackets if m_["ticker"] == ticker),
+                    None,
+                )
+                if cached:
+                    bracket_low, bracket_high = cached[1]
+                    logger.info(f"Settlement bounds from cache for {ticker}: [{bracket_low:,.0f}-{bracket_high:,.0f}]")
+                else:
+                    # Try fetching from Kalshi API
+                    try:
+                        api_market = self.kalshi_reader.get_market(ticker)
+                        if api_market:
+                            bounds = parse_bracket_bounds(api_market)
+                            if bounds:
+                                bracket_low, bracket_high = bounds
+                                logger.info(f"Settlement bounds from API for {ticker}: [{bracket_low:,.0f}-{bracket_high:,.0f}]")
+                    except Exception as e:
+                        logger.debug(f"API lookup failed for {ticker}: {e}")
+
+            if bracket_low is None or bracket_high is None:
+                # Last resort: ticker parse with $500 width
+                m = re.search(r"-B(\d+)$", ticker)
+                if not m:
+                    logger.warning(f"Cannot parse bracket from ticker {ticker}, skipping settlement")
+                    continue
+                bracket_low = float(m.group(1))
+                bracket_high = bracket_low + 500.0
+                logger.warning(
+                    f"Using hardcoded $500 bracket width for settlement of {ticker} — "
+                    f"actual width may differ"
+                )
+
+            # Find the BTC price at settlement time (trade time + 15 min)
+            settle_time_ms = trade["timestamp"] + settle_delay_ms
+            # Get the candle that covers the settlement time
+            row = self.db.conn.execute(
+                "SELECT close FROM candles WHERE open_time <= ? ORDER BY open_time DESC LIMIT 1",
+                (settle_time_ms,),
+            ).fetchone()
+
+            if not row:
+                logger.debug(f"No candle data yet for trade {trade['id']} settlement")
+                continue
+
+            settle_price = float(row["close"])
+            in_bracket = bracket_low <= settle_price < bracket_high
+            result = "yes" if in_bracket else "no"
+
+            # Calculate P&L
+            side = trade["side"]
+            price_cents = trade["price"]
+            size = trade["size"]
+            cost = price_cents * size / 100  # what we paid
+
+            if side == result:
+                # Won: receive $1 per contract, minus cost
+                pnl = size - cost
+            else:
+                # Lost: lose the cost
+                pnl = -cost
+
+            # Resolve in mock client and DB
+            if hasattr(self.kalshi, "resolve_market"):
+                self.kalshi.resolve_market(ticker, result)
+
+            self.trade_logger.update_pnl(trade["id"], pnl)
+            logger.info(
+                f"Settled trade {trade['id']}: {ticker} {side} @ {price_cents}c x{int(size)} | "
+                f"BTC={settle_price:,.2f} bracket=[{bracket_low:,.0f}-{bracket_high:,.0f}] "
+                f"result={result} PnL=${pnl:.2f}"
             )
 
     async def _dashboard_loop(self):
@@ -403,6 +821,7 @@ class TradingSystem:
         self.running = False
         self.order_manager.cancel_all()
         self.order_manager.cleanup()
+        await self.kalshi_ws.close()
         await self.binance.close()
         if hasattr(self.kalshi, "close"):
             self.kalshi.close()
