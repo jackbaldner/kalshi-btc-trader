@@ -60,9 +60,35 @@ CREATE TABLE IF NOT EXISTS strategy_signals (
     features_json TEXT
 );
 
+CREATE TABLE IF NOT EXISTS evaluations (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    timestamp INTEGER,
+    event_close_time TEXT,
+    ticker TEXT,
+    bracket_low REAL,
+    bracket_high REAL,
+    btc_price REAL,
+    raw_model_vol REAL,
+    predicted_vol REAL,
+    implied_vol REAL,
+    blended_vol REAL,
+    shrinkage REAL,
+    bracket_prob REAL,
+    market_prob REAL,
+    edge REAL,
+    should_trade INTEGER,
+    realized_vol REAL,
+    realized_return REAL,
+    price_at_close REAL,
+    in_bracket INTEGER,
+    resolved INTEGER DEFAULT 0
+);
+
 CREATE INDEX IF NOT EXISTS idx_candles_time ON candles(open_time);
 CREATE INDEX IF NOT EXISTS idx_trades_time ON trades(timestamp);
 CREATE INDEX IF NOT EXISTS idx_snapshots_time ON kalshi_snapshots(timestamp);
+CREATE INDEX IF NOT EXISTS idx_evaluations_time ON evaluations(timestamp);
+CREATE INDEX IF NOT EXISTS idx_evaluations_resolved ON evaluations(resolved);
 """
 
 
@@ -171,6 +197,36 @@ class Database:
     def get_all_trades(self) -> pd.DataFrame:
         """Get all trades as a DataFrame for dashboard use."""
         return pd.read_sql_query("SELECT * FROM trades ORDER BY timestamp DESC", self.conn)
+
+    # -- Evaluations --
+    def insert_evaluation(self, timestamp: int, event_close_time: str, ticker: str,
+                          bracket_low: float, bracket_high: float, btc_price: float,
+                          raw_model_vol: float, predicted_vol: float, implied_vol: float,
+                          blended_vol: float, shrinkage: float, bracket_prob: float,
+                          market_prob: float, edge: float, should_trade: bool):
+        self.conn.execute(
+            "INSERT INTO evaluations (timestamp, event_close_time, ticker, "
+            "bracket_low, bracket_high, btc_price, raw_model_vol, predicted_vol, "
+            "implied_vol, blended_vol, shrinkage, bracket_prob, market_prob, edge, should_trade) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            (timestamp, event_close_time, ticker, bracket_low, bracket_high, btc_price,
+             raw_model_vol, predicted_vol, implied_vol, blended_vol, shrinkage,
+             bracket_prob, market_prob, edge, int(should_trade)),
+        )
+        self.conn.commit()
+
+    def get_unresolved_evaluations(self) -> list[dict]:
+        cursor = self.conn.execute("SELECT * FROM evaluations WHERE resolved = 0")
+        return [dict(row) for row in cursor.fetchall()]
+
+    def resolve_evaluation(self, eval_id: int, realized_vol: float, realized_return: float,
+                           price_at_close: float, in_bracket: bool):
+        self.conn.execute(
+            "UPDATE evaluations SET realized_vol = ?, realized_return = ?, "
+            "price_at_close = ?, in_bracket = ?, resolved = 1 WHERE id = ?",
+            (realized_vol, realized_return, price_at_close, int(in_bracket), eval_id),
+        )
+        self.conn.commit()
 
     # -- Strategy Signals --
     def insert_signal(self, timestamp: int, strategy: str, direction: str,

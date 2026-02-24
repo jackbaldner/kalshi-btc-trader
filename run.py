@@ -180,9 +180,10 @@ class TradingSystem:
                     await self._poll_kalshi()
                     self._last_kalshi_poll = now
 
-                # Settle expired trades
+                # Settle expired trades and resolve evaluations
                 if now - self._last_settlement_check >= self._settlement_interval:
                     await self._settle_trades()
+                    await self._resolve_evaluations()
                     self.order_manager.cancel_stale_orders()
                     self._last_settlement_check = now
 
@@ -535,6 +536,29 @@ class TradingSystem:
             last_signal=f"{result.direction.value} ({result.ensemble_prob:.2f})",
         )
 
+        # Log every evaluation to DB (even if we don't trade)
+        try:
+            edge = (bracket_prob - implied_prob) if bracket_prob is not None else 0.0
+            self.db.insert_evaluation(
+                timestamp=int(time.time() * 1000),
+                event_close_time=self._event_close_time or "",
+                ticker=ticker,
+                bracket_low=bracket[0],
+                bracket_high=bracket[1],
+                btc_price=self._btc_price,
+                raw_model_vol=raw_pred_vol if self._btc_price > 0 else 0.0,
+                predicted_vol=predicted_vol or 0.0,
+                implied_vol=implied_vol or 0.0,
+                blended_vol=predicted_vol or 0.0,
+                shrinkage=self.vol_model.shrinkage,
+                bracket_prob=bracket_prob or 0.0,
+                market_prob=implied_prob,
+                edge=edge,
+                should_trade=result.should_trade,
+            )
+        except Exception as e:
+            logger.warning(f"Failed to log evaluation: {e}")
+
         if not result.should_trade:
             logger.info(f"No edge for [{bracket[0]:,.0f}-{bracket[1]:,.0f}] — skipping")
             return
@@ -857,6 +881,68 @@ class TradingSystem:
         )
 
         return confidence
+
+    async def _resolve_evaluations(self):
+        """Resolve evaluations whose event windows have closed.
+
+        For each unresolved evaluation, looks up the actual BTC price at the event close
+        time and computes realized return/vol. This creates the (predicted, implied, realized)
+        triples needed for future model calibration.
+        """
+        unresolved = self.db.get_unresolved_evaluations()
+        if not unresolved:
+            return
+
+        now_ms = int(time.time() * 1000)
+
+        for ev in unresolved:
+            # Parse event close time to determine if the window has elapsed
+            close_time_str = ev.get("event_close_time", "")
+            if not close_time_str:
+                continue
+
+            try:
+                close_dt = datetime.fromisoformat(close_time_str.replace("Z", "+00:00"))
+                close_time_ms = int(close_dt.timestamp() * 1000)
+            except (ValueError, TypeError):
+                continue
+
+            # Only resolve after the event has closed (+ 60s buffer for candle availability)
+            if now_ms < close_time_ms + 60_000:
+                continue
+
+            # Look up the candle that covers the event close time
+            row = self.db.conn.execute(
+                "SELECT close FROM candles WHERE open_time <= ? ORDER BY open_time DESC LIMIT 1",
+                (close_time_ms,),
+            ).fetchone()
+            if not row:
+                continue
+
+            price_at_close = float(row["close"])
+            btc_price = ev["btc_price"]
+            if btc_price <= 0:
+                continue
+
+            realized_return = (price_at_close - btc_price) / btc_price
+            realized_vol = abs(realized_return)
+            in_bracket = ev["bracket_low"] <= price_at_close < ev["bracket_high"]
+
+            self.db.resolve_evaluation(
+                eval_id=ev["id"],
+                realized_vol=realized_vol,
+                realized_return=realized_return,
+                price_at_close=price_at_close,
+                in_bracket=in_bracket,
+            )
+
+        resolved_count = len([e for e in unresolved
+                              if e.get("event_close_time")
+                              and now_ms >= int(datetime.fromisoformat(
+                                  e["event_close_time"].replace("Z", "+00:00")
+                              ).timestamp() * 1000) + 60_000])
+        if resolved_count > 0:
+            logger.info(f"Resolved {resolved_count} evaluations with realized vol data")
 
     async def _settle_trades(self):
         """Check unresolved trades and settle.
