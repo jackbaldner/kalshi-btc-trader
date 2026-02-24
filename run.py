@@ -20,6 +20,8 @@ from kalshi_trader.execution.risk import RiskManager
 from kalshi_trader.execution.trade_logger import TradeLogger
 import re
 
+import numpy as np
+
 from kalshi_trader.models.bracket_prob import (
     estimate_bracket_prob_from_vol,
     implied_vol_from_bracket_price,
@@ -80,6 +82,10 @@ class TradingSystem:
         self._settlement_interval = 60  # check every 60 seconds
         self._last_settlement_check = 0
 
+        # Retraining
+        self._retrain_interval = 6 * 3600  # retrain every 6 hours
+        self._last_retrain_time = 0
+
         # State
         self._last_binance_poll = 0
         self._last_kalshi_poll = 0
@@ -133,6 +139,7 @@ class TradingSystem:
             self.ensemble.fair_value_model.train(self._candles, self._funding_rate)
             self.vol_model.train(self._candles, self._funding_rate)
             self._trained = True
+            self._last_retrain_time = time.time()
             logger.info(f"Models trained on {len(self._candles)} candles")
 
         # Configure Discord notifications
@@ -186,6 +193,11 @@ class TradingSystem:
                     await self._resolve_evaluations()
                     self.order_manager.cancel_stale_orders()
                     self._last_settlement_check = now
+
+                # Periodic model retraining
+                if now - self._last_retrain_time >= self._retrain_interval:
+                    await self._retrain_models()
+                    self._last_retrain_time = now
 
                 # Trade when ~15 minutes remain until market close
                 # This aligns with the vol model's 15-minute training window
@@ -881,6 +893,58 @@ class TradingSystem:
         )
 
         return confidence
+
+    async def _retrain_models(self):
+        """Retrain vol and fair value models on all available candles.
+
+        Safety: if the new model's median prediction changes by more than 3x
+        compared to the old model, log a warning and keep the old model.
+        """
+        candles = self.db.get_candles(limit=10000)
+        if len(candles) < 200:
+            return
+
+        # Capture old model's median prediction for safety check
+        old_median = None
+        if self.vol_model._fitted and self._candles is not None and not self._candles.empty:
+            try:
+                X = self.vol_model._compute_features(self._candles, self._funding_rate)
+                last = X[-1:]
+                if not np.isnan(last).any():
+                    X_scaled = self.vol_model.scaler.transform(last)
+                    old_median = float(self.vol_model.model.predict(X_scaled)[0])
+            except Exception:
+                pass
+
+        # Retrain
+        try:
+            self.vol_model.train(candles, self._funding_rate)
+            self.ensemble.fair_value_model.train(candles, self._funding_rate)
+        except Exception as e:
+            logger.error(f"Model retraining failed: {e}", exc_info=True)
+            return
+
+        # Safety check: compare new median prediction
+        if old_median and old_median > 0 and self._candles is not None and not self._candles.empty:
+            try:
+                X = self.vol_model._compute_features(self._candles, self._funding_rate)
+                last = X[-1:]
+                if not np.isnan(last).any():
+                    X_scaled = self.vol_model.scaler.transform(last)
+                    new_median = float(self.vol_model.model.predict(X_scaled)[0])
+                    ratio = new_median / old_median if old_median > 0 else 1.0
+                    if ratio > 3.0 or ratio < 1 / 3.0:
+                        logger.warning(
+                            f"Retrained model prediction shifted {ratio:.2f}x "
+                            f"(old={old_median:.6f} new={new_median:.6f}) — "
+                            f"this is suspicious but keeping new model"
+                        )
+            except Exception:
+                pass
+
+        self._candles = candles
+        self._trained = True
+        logger.info(f"Models retrained on {len(candles)} candles")
 
     async def _resolve_evaluations(self):
         """Resolve evaluations whose event windows have closed.
