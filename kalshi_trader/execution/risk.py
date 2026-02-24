@@ -50,12 +50,21 @@ class RiskManager:
         return True, "ok"
 
     def update_exposure(self, positions: list[dict]):
-        """Recalculate current exposure from positions."""
+        """Recalculate current exposure from positions.
+
+        Handles both live Kalshi API format (market_exposure in cents)
+        and mock client format (yes_count/avg_yes_price).
+        """
         total = 0.0
         for pos in positions:
-            yes_cost = pos.get("yes_count", 0) * pos.get("avg_yes_price", 0) / 100
-            no_cost = pos.get("no_count", 0) * pos.get("avg_no_price", 0) / 100
-            total += yes_cost + no_cost
+            # Live API: market_exposure is in cents
+            if "market_exposure" in pos:
+                total += pos["market_exposure"] / 100
+            else:
+                # Mock client format
+                yes_cost = pos.get("yes_count", 0) * pos.get("avg_yes_price", 0) / 100
+                no_cost = pos.get("no_count", 0) * pos.get("avg_no_price", 0) / 100
+                total += yes_cost + no_cost
         self._current_exposure = total
 
     @property

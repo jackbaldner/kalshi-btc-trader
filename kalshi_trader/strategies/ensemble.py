@@ -84,44 +84,6 @@ class EnsembleStrategy:
         result.model_prob = self.fair_value_model.predict(candles, funding)
         market_data["fair_value"] = result.model_prob
 
-        # Model direction
-        if result.model_prob > 0.5:
-            model_dir = Direction.UP
-        elif result.model_prob < 0.5:
-            model_dir = Direction.DOWN
-        else:
-            result.should_trade = False
-            return result
-
-        # Collect strategy signals and find confirmations
-        confirmations = []
-        for name, strategy in self.strategies.items():
-            signal = strategy.generate_signal(candles, market_data)
-            result.signals.append(signal)
-
-            # Strategy confirms model if it points same direction
-            if signal.direction == model_dir and signal.confidence > 0:
-                confirmations.append(signal)
-
-        result.signal_count = len(confirmations)
-        result.confirming_strategies = [s.strategy for s in confirmations]
-
-        # Require minimum confirmations
-        if len(confirmations) < self.min_confirmations:
-            result.should_trade = False
-            return result
-
-        # Ensemble probability: model prob + confirmation boost
-        # Each confirming signal adds a small nudge (1% per signal)
-        confirmation_boost = sum(
-            0.01 * (s.confidence - 0.5) * 2  # scale confidence to [-1, 1] range
-            for s in confirmations
-        )
-
-        result.ensemble_prob = result.model_prob + confirmation_boost
-        result.ensemble_prob = max(0.35, min(0.65, result.ensemble_prob))
-        result.direction = model_dir
-
         # Market implied probability (bracket price from Kalshi)
         result.implied_prob = market_data.get("implied_prob", 0.5)
 
@@ -135,23 +97,65 @@ class EnsembleStrategy:
             result.implied_vol = implied_vol
 
         if bracket_prob is not None:
-            # Bracket mode: our bracket prob (from vol prediction) vs market price
+            # Bracket mode: vol edge stands on its own — no directional confirmation needed
             our_p = bracket_prob
             market_p = result.implied_prob
+            result.ensemble_prob = bracket_prob
             result.edge = our_p - market_p
 
             if result.edge > 0:
-                result.side = "yes"  # predicted vol < implied → bracket underpriced
+                result.side = "yes"
             elif result.edge < -self.edge_threshold:
-                result.side = "no"   # predicted vol > implied → bracket overpriced
+                result.side = "no"
                 result.edge = abs(result.edge)
                 our_p = 1 - bracket_prob
                 market_p = 1 - result.implied_prob
+                result.ensemble_prob = 1 - bracket_prob
             else:
                 result.should_trade = False
                 return result
+
+            # Still collect signals for logging (but don't gate on them)
+            model_dir = Direction.UP if result.model_prob > 0.5 else Direction.DOWN
+            result.direction = model_dir
+            for name, strategy in self.strategies.items():
+                signal = strategy.generate_signal(candles, market_data)
+                result.signals.append(signal)
+                if signal.direction == model_dir and signal.confidence > 0:
+                    result.confirming_strategies.append(signal.strategy)
+            result.signal_count = len(result.confirming_strategies)
         else:
-            # Fallback: directional mode (no bracket info available)
+            # Directional mode: require strategy confirmation
+            if result.model_prob > 0.5:
+                model_dir = Direction.UP
+            elif result.model_prob < 0.5:
+                model_dir = Direction.DOWN
+            else:
+                result.should_trade = False
+                return result
+
+            confirmations = []
+            for name, strategy in self.strategies.items():
+                signal = strategy.generate_signal(candles, market_data)
+                result.signals.append(signal)
+                if signal.direction == model_dir and signal.confidence > 0:
+                    confirmations.append(signal)
+
+            result.signal_count = len(confirmations)
+            result.confirming_strategies = [s.strategy for s in confirmations]
+            result.direction = model_dir
+
+            if len(confirmations) < self.min_confirmations:
+                result.should_trade = False
+                return result
+
+            confirmation_boost = sum(
+                0.01 * (s.confidence - 0.5) * 2
+                for s in confirmations
+            )
+            result.ensemble_prob = result.model_prob + confirmation_boost
+            result.ensemble_prob = max(0.35, min(0.65, result.ensemble_prob))
+
             if result.direction == Direction.UP:
                 result.side = "yes"
                 our_p = result.ensemble_prob
@@ -185,11 +189,12 @@ class EnsembleStrategy:
                     f"impl_vol={result.implied_vol:.5f} "
                     f"vol_ratio={result.predicted_vol/result.implied_vol:.2f} "
                 )
+            mode_str = "bracket" if bracket_prob is not None else "directional"
             logger.info(
-                f"Ensemble: side={result.side} {vol_str}"
+                f"Ensemble ({mode_str}): side={result.side} {vol_str}"
                 f"implied={result.implied_prob:.3f} edge={result.edge:.3f} "
                 f"kelly={result.kelly_f:.3f} ramp={ramp:.2f} contracts={result.contracts} "
-                f"confirmed_by={result.confirming_strategies} regime={regime}"
+                f"signals={result.confirming_strategies} regime={regime}"
             )
 
         return result

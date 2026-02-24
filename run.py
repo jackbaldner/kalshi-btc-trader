@@ -6,7 +6,7 @@ import logging
 import signal
 import sys
 import time
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 
 from kalshi_trader.config import load_config
 from kalshi_trader.dashboard.cli import Dashboard
@@ -26,6 +26,12 @@ from kalshi_trader.models.bracket_prob import (
     parse_bracket_bounds,
 )
 from kalshi_trader.models.vol_model import VolModel
+from kalshi_trader.notifications.discord import (
+    configure as configure_discord,
+    send_startup_alert,
+    send_trade_alert,
+    send_settlement_alert,
+)
 from kalshi_trader.strategies.ensemble import EnsembleStrategy
 
 logger = logging.getLogger(__name__)
@@ -86,7 +92,8 @@ class TradingSystem:
         self._orderbook = None
         self._candles = None
         self._trained = False
-        self._last_trade_window = -1  # duplicate trade guard
+        self._last_trade_window = ""  # dedup key: event close time
+        self._event_close_time = None  # ISO timestamp of current event close
 
     async def start(self):
         """Initialize and start the trading loop."""
@@ -110,9 +117,23 @@ class TradingSystem:
             self._trained = True
             logger.info(f"Models trained on {len(self._candles)} candles")
 
+        # Configure Discord notifications
+        configure_discord(self.cfg.get("discord", {}).get("webhook_url"))
+
         # Get initial price
         self._btc_price = await self.binance.get_price()
         logger.info(f"BTC price: ${self._btc_price:,.2f}")
+
+        # Send startup alert
+        try:
+            balance = self.kalshi.get_balance()
+            send_startup_alert(
+                mode=self.mode,
+                balance=balance,
+                event_ticker=self.cfg["kalshi"].get("event_ticker", "KXBTC"),
+            )
+        except Exception as e:
+            logger.warning(f"Failed to send startup alert: {e}")
 
         # Main loop
         self.running = True
@@ -144,17 +165,29 @@ class TradingSystem:
                 # Settle expired trades
                 if now - self._last_settlement_check >= self._settlement_interval:
                     await self._settle_trades()
+                    self.order_manager.cancel_stale_orders()
                     self._last_settlement_check = now
 
-                # Trade 2 minutes before the 15-min boundary to beat the crowd
-                # e.g. trade at :13, :28, :43, :58 instead of :00, :15, :30, :45
-                trade_offset = self.cfg["strategy"].get("trade_offset_sec", 120)
-                utc_now = datetime.now(timezone.utc)
-                secs_into_window = (utc_now.minute % 15) * 60 + utc_now.second
-                window_duration = 15 * 60
-                secs_until_boundary = window_duration - secs_into_window
-                if secs_until_boundary <= trade_offset and secs_until_boundary > (trade_offset - 30):
-                    await self._evaluate_and_trade()
+                # Trade when ~15 minutes remain until market close
+                # This aligns with the vol model's 15-minute training window
+                if self._event_close_time:
+                    try:
+                        close_dt = datetime.fromisoformat(
+                            self._event_close_time.replace("Z", "+00:00")
+                        )
+                        utc_now = datetime.now(timezone.utc)
+                        secs_until_close = (close_dt - utc_now).total_seconds()
+                        trade_before_sec = self.cfg["strategy"].get(
+                            "trade_before_close_sec", 900
+                        )  # 900s = 15 min
+                        # Trigger in a 30-second window around the target time
+                        if (trade_before_sec - 30) <= secs_until_close <= trade_before_sec:
+                            try:
+                                await self._evaluate_and_trade()
+                            except Exception as e:
+                                logger.error(f"Evaluate-and-trade failed: {e}", exc_info=True)
+                    except (ValueError, TypeError) as e:
+                        logger.debug(f"Could not parse close time: {e}")
 
                 await asyncio.sleep(1)
 
@@ -176,7 +209,16 @@ class TradingSystem:
                 ticker = self._current_market["ticker"]
                 await self.kalshi_ws.connect(ticker)
         except asyncio.CancelledError:
-            await self.kalshi_ws.close()
+            try:
+                await self.kalshi_ws.close()
+            except Exception:
+                pass
+        except Exception as e:
+            logger.error(f"WebSocket loop crashed: {e}")
+            try:
+                await self.kalshi_ws.close()
+            except Exception:
+                pass
 
     async def _poll_binance(self):
         """Fetch latest BTC price and candles."""
@@ -213,11 +255,18 @@ class TradingSystem:
         to the current BTC price — that's the most actionable market.
         """
         try:
-            # Dynamically find the nearest expiring KXBTC event
-            event_ticker = self.kalshi_reader.get_nearest_event_ticker()
+            # Dynamically find the nearest expiring KXBTC event (within 24h)
+            event_ticker, close_time = self.kalshi_reader.get_nearest_event_ticker(max_hours=24)
             if event_ticker and event_ticker != self._current_event_ticker:
                 self._current_event_ticker = event_ticker
-                logger.info(f"Tracking event: {event_ticker}")
+                self._event_close_time = close_time
+                logger.info(f"Tracking event: {event_ticker} (closes {close_time})")
+            elif not event_ticker:
+                if self._current_event_ticker:
+                    logger.warning("No events within 24h — waiting for new event")
+                    self._current_event_ticker = None
+                    self._all_brackets = []
+                return
 
             markets = self.kalshi_reader.get_markets(event_ticker=self._current_event_ticker)
             if not markets:
@@ -279,6 +328,28 @@ class TradingSystem:
                 f"{len(parsed)} parsed / {len(markets)} total brackets"
             )
 
+            # Log time until next evaluation
+            if self._event_close_time:
+                try:
+                    close_dt = datetime.fromisoformat(self._event_close_time.replace("Z", "+00:00"))
+                    utc_now = datetime.now(timezone.utc)
+                    secs_until_close = (close_dt - utc_now).total_seconds()
+                    trade_before_sec = self.cfg["strategy"].get("trade_before_close_sec", 900)
+                    secs_until_eval = secs_until_close - trade_before_sec
+                    if secs_until_eval > 0:
+                        h, remainder = divmod(int(secs_until_eval), 3600)
+                        m, s = divmod(remainder, 60)
+                        eval_time = close_dt - timedelta(seconds=trade_before_sec)
+                        logger.info(
+                            f"Next eval in {h}h{m:02d}m{s:02d}s "
+                            f"(at {eval_time.strftime('%H:%M:%S UTC')}, "
+                            f"{trade_before_sec // 60}min before close)"
+                        )
+                    elif secs_until_close > 0:
+                        logger.info(f"Eval window active — {secs_until_close:.0f}s until market close")
+                except (ValueError, TypeError):
+                    pass
+
             # Snapshot to DB
             ts = int(time.time() * 1000)
             self.db.insert_snapshot(
@@ -297,12 +368,11 @@ class TradingSystem:
 
     async def _evaluate_and_trade(self):
         """Run ensemble strategy across current bracket ± 2 adjacent brackets."""
-        # Duplicate evaluation guard: only evaluate once per 15-min window
-        utc_now = datetime.now(timezone.utc)
-        window_id = utc_now.hour * 4 + utc_now.minute // 15
-        if window_id == self._last_trade_window:
+        # Dedup: only evaluate once per market close event
+        close_key = self._event_close_time or ""
+        if close_key == self._last_trade_window:
             return
-        self._last_trade_window = window_id
+        # Mark dedup AFTER successful evaluation (set at end of method)
         self._traded_brackets_this_window = set()
 
         if self._candles is None or self._candles.empty:
@@ -318,10 +388,15 @@ class TradingSystem:
 
         if not self._all_brackets:
             if self._current_market and self._current_bracket:
-                # Fallback: evaluate just the current bracket
+                try:
+                    bal = self.kalshi.get_balance()
+                except Exception as e:
+                    logger.error(f"Failed to fetch balance: {e}")
+                    return
                 await self._evaluate_single_bracket(
-                    self._current_market, self._current_bracket, self.kalshi.get_balance(),
+                    self._current_market, self._current_bracket, bal,
                 )
+                self._last_trade_window = close_key
             return
 
         # Find index of the bracket containing current price
@@ -350,34 +425,42 @@ class TradingSystem:
             f"center={center_idx})"
         )
 
-        balance = self.kalshi.get_balance()
+        try:
+            balance = self.kalshi.get_balance()
+        except Exception as e:
+            logger.error(f"Failed to fetch balance, skipping evaluation: {e}")
+            return
         for market, bracket in brackets_to_eval:
             await self._evaluate_single_bracket(market, bracket, balance)
             # Refresh balance after each trade so Kelly sizing adapts
-            balance = self.kalshi.get_balance()
+            try:
+                balance = self.kalshi.get_balance()
+            except Exception as e:
+                logger.warning(f"Failed to refresh balance: {e}")
+                continue
+
+        # Mark this window as evaluated only after successful completion
+        self._last_trade_window = close_key
 
     async def _evaluate_single_bracket(self, market: dict, bracket: tuple, balance: float):
         """Evaluate and potentially trade a single bracket."""
         ticker = market["ticker"]
 
-        # Per-bracket dedup: check DB for this specific ticker in this window
+        # Per-bracket dedup: don't re-trade same ticker within an hour
         if ticker in self._traded_brackets_this_window:
             return
-        utc_now = datetime.now(timezone.utc)
-        window_start = utc_now.replace(minute=(utc_now.minute // 15) * 15, second=0, microsecond=0)
-        window_start_ms = int(window_start.timestamp() * 1000)
-        window_end_ms = window_start_ms + 15 * 60 * 1000
+        one_hour_ago_ms = int((datetime.now(timezone.utc) - timedelta(hours=1)).timestamp() * 1000)
         existing = self.db.conn.execute(
-            "SELECT COUNT(*) as c FROM trades WHERE timestamp >= ? AND timestamp < ? AND ticker = ?",
-            (window_start_ms, window_end_ms, ticker),
+            "SELECT COUNT(*) as c FROM trades WHERE timestamp >= ? AND ticker = ?",
+            (one_hour_ago_ms, ticker),
         ).fetchone()
         if existing["c"] > 0:
-            logger.debug(f"Trade already exists for {ticker} in window {window_start.strftime('%H:%M')}, skipping")
+            logger.debug(f"Already traded {ticker} within the last hour, skipping")
             return
 
         # Per-bracket daily limit: avoid overconcentration on one ticker
         max_daily_per_bracket = self.cfg["risk"].get("max_daily_trades_per_bracket", 4)
-        day_start = utc_now.replace(hour=0, minute=0, second=0, microsecond=0)
+        day_start = datetime.now(timezone.utc).replace(hour=0, minute=0, second=0, microsecond=0)
         day_start_ms = int(day_start.timestamp() * 1000)
         daily_count = self.db.conn.execute(
             "SELECT COUNT(*) as c FROM trades WHERE timestamp >= ? AND ticker = ?",
@@ -466,9 +549,22 @@ class TradingSystem:
         if order_size <= 0:
             return
 
+        # Liquidity check: cap order size to 50% of available book depth
+        max_liquidity_pct = self.cfg["risk"].get("max_book_take_pct", 0.5)
+        if available_depth > 0 and order_size > int(available_depth * max_liquidity_pct):
+            capped_size = max(1, int(available_depth * max_liquidity_pct))
+            logger.info(
+                f"Liquidity cap: {order_size} -> {capped_size} contracts "
+                f"(book has {available_depth}, taking max {max_liquidity_pct:.0%})"
+            )
+            order_size = capped_size
+
+        if order_size <= 0:
+            return
+
         logger.info(
             f"Order plan: {result.side} {order_size}x {ticker} @ {price_cents}c "
-            f"(book has {available_depth}, partial fill OK)"
+            f"(book has {available_depth})"
         )
 
         # Risk check
@@ -483,29 +579,102 @@ class TradingSystem:
         )
 
         # Place order
-        order = self.order_manager.place_order(
-            ticker, result.side, price_cents, order_size,
-            expiry_time_ms=market.get("close_time"),
-        )
+        try:
+            order = self.order_manager.place_order(
+                ticker, result.side, price_cents, order_size,
+                expiry_time_ms=market.get("close_time"),
+            )
+        except Exception as e:
+            logger.error(f"Order placement failed for {ticker}: {e}")
+            return
 
         if order and "error" not in order:
-            filled_count = order.get("count", result.contracts)
-            fill_price = order.get("yes_price", price_cents)
-            self.trade_logger.log_trade(
-                ticker, result.side, fill_price, filled_count,
-                "ensemble", result.edge, result.ensemble_prob, implied_prob,
-                predicted_vol=predicted_vol, implied_vol=implied_vol,
-                fill_confidence=fill_confidence,
-                bracket_low=bracket[0], bracket_high=bracket[1],
-            )
+            order_id = order.get("order_id") or order.get("order", {}).get("order_id")
+            order_obj = order.get("order", order)
+            status = order_obj.get("status", "")
+            filled_count = order_obj.get("fill_count", 0)
+            remaining = order_obj.get("remaining_count", order_size)
+
+            if filled_count == 0 and order_id and status not in ("canceled", "cancelled"):
+                # Order not immediately filled — wait briefly and recheck
+                await asyncio.sleep(3)
+                try:
+                    order_status = self.kalshi.get_order(order_id)
+                    filled_count = order_status.get("fill_count", 0)
+                    remaining = order_status.get("remaining_count", order_size)
+                    status = order_status.get("status", status)
+                    logger.info(f"Recheck order {order_id}: fill_count={filled_count} status={status}")
+                except Exception as e:
+                    logger.warning(f"Failed to recheck order {order_id}: {e}")
+
+            if filled_count > 0:
+                # Order filled (fully or partially) — log the trade
+                fill_price = order_obj.get("yes_price", price_cents)
+                logger.info(
+                    f"Order filled: {order_id} {result.side} {filled_count}x {ticker} "
+                    f"@ {fill_price}c (status={status})"
+                )
+                self.trade_logger.log_trade(
+                    ticker, result.side, fill_price, filled_count,
+                    "ensemble", result.edge, result.ensemble_prob, implied_prob,
+                    predicted_vol=predicted_vol, implied_vol=implied_vol,
+                    fill_confidence=fill_confidence,
+                    bracket_low=bracket[0], bracket_high=bracket[1],
+                )
+                try:
+                    post_balance = self.kalshi.get_balance()
+                except Exception:
+                    post_balance = balance
+                try:
+                    send_trade_alert(
+                        ticker=ticker,
+                        side=result.side,
+                        price=fill_price,
+                        size=filled_count,
+                        edge=result.edge,
+                        bracket_low=bracket[0],
+                        bracket_high=bracket[1],
+                        balance=post_balance,
+                        predicted_vol=predicted_vol,
+                        implied_vol=implied_vol,
+                    )
+                except Exception as e:
+                    logger.warning(f"Discord trade alert failed: {e}")
+            else:
+                # Order accepted but not filled after recheck
+                logger.info(
+                    f"Order resting (unfilled): {order_id} {result.side} {order_size}x {ticker} "
+                    f"@ {price_cents}c (status={status}, remaining={remaining})"
+                )
+
+            # Schedule auto-cancel for any unfilled portion
+            close_time = market.get("close_time")
+            if order_id and close_time and self.mode == "live" and remaining > 0:
+                try:
+                    # Convert ISO string to milliseconds for schedule_auto_cancel
+                    if isinstance(close_time, str):
+                        close_dt_parsed = datetime.fromisoformat(close_time.replace("Z", "+00:00"))
+                        close_time_ms = int(close_dt_parsed.timestamp() * 1000)
+                    else:
+                        close_time_ms = int(close_time)
+                    loop = asyncio.get_running_loop()
+                    self.order_manager.schedule_auto_cancel(order_id, close_time_ms, loop)
+                except Exception as e:
+                    logger.warning(f"Failed to schedule auto-cancel for {order_id}: {e}")
             self._traded_brackets_this_window.add(ticker)
             # Update exposure so risk checks work across multi-bracket trades
-            positions = self.kalshi.get_positions()
-            self.risk.update_exposure(positions)
+            try:
+                positions = self.kalshi.get_positions()
+                self.risk.update_exposure(positions)
+            except Exception as e:
+                logger.warning(f"Failed to update exposure after trade: {e}")
 
     def _get_realistic_price(self, book: dict, side: str, edge: float,
                                model_prob: float) -> tuple[int | None, int]:
-        """Determine the best fillable price from the orderbook that still has edge.
+        """Determine an aggressive fillable price from the orderbook.
+
+        Prices 1c above the best ask to guarantee crossing the spread.
+        Only proceeds if we still have edge after the aggressive pricing.
 
         Returns (price_cents, available_depth) or (None, 0) if no viable price.
         """
@@ -525,30 +694,29 @@ class TradingSystem:
             key=lambda x: x[0],
         )
 
-        # Find the best ask price where we still have edge
-        # Edge = model_prob - price/100 (for YES side)
-        # We'll pay up to the ask as long as edge remains above threshold
         edge_threshold = self.cfg["strategy"]["edge_threshold"]
+        aggression = self.cfg["strategy"].get("price_aggression_cents", 1)
 
         for ask_price, depth in ask_levels:
+            # Pay aggression cents above the ask to guarantee fill
+            fill_price = min(ask_price + aggression, 99)
+
             if side == "yes":
-                effective_implied = ask_price / 100.0
+                effective_implied = fill_price / 100.0
                 remaining_edge = model_prob - effective_implied
             else:
-                effective_implied = (100 - ask_price) / 100.0
+                effective_implied = (100 - fill_price) / 100.0
                 remaining_edge = (1 - model_prob) - effective_implied
 
             if remaining_edge >= edge_threshold:
-                # Still have edge at this price — use it
-                # Sum up all depth at this price and cheaper
-                total_depth = sum(q for p, q in ask_levels if p <= ask_price)
+                total_depth = sum(q for p, q in ask_levels if p <= fill_price)
                 logger.info(
-                    f"Realistic price: {side} @ {ask_price}c (ask) | "
-                    f"edge_at_ask={remaining_edge:.4f} depth={total_depth}"
+                    f"Aggressive price: {side} @ {fill_price}c (ask={ask_price}c +{aggression}c) | "
+                    f"edge_at_fill={remaining_edge:.4f} depth={total_depth}"
                 )
-                return ask_price, total_depth
+                return fill_price, total_depth
 
-        # No ask level has enough edge
+        # No ask level has enough edge even without aggression
         best_ask = ask_levels[0][0] if ask_levels else 0
         if side == "yes":
             best_edge = model_prob - best_ask / 100.0
@@ -673,7 +841,15 @@ class TradingSystem:
         return confidence
 
     async def _settle_trades(self):
-        """Check unresolved trades and settle any whose 15-min window has expired."""
+        """Check unresolved trades and settle.
+
+        Paper mode: simulate settlement using BTC price 15 min after trade.
+        Live mode: query Kalshi API for actual position/fill status.
+        """
+        if self.mode == "live":
+            await self._settle_trades_live()
+            return
+
         unresolved = self.db.get_unresolved_trades()
         if not unresolved:
             return
@@ -765,11 +941,89 @@ class TradingSystem:
                 f"BTC={settle_price:,.2f} bracket=[{bracket_low:,.0f}-{bracket_high:,.0f}] "
                 f"result={result} PnL=${pnl:.2f}"
             )
+            try:
+                send_settlement_alert(
+                    ticker=ticker,
+                    side=side,
+                    result=result,
+                    pnl=pnl,
+                    price=price_cents,
+                    size=int(size),
+                )
+            except Exception as e:
+                logger.warning(f"Discord settlement alert failed: {e}")
+
+    async def _settle_trades_live(self):
+        """Settle trades using actual Kalshi position data.
+
+        Queries the API for fills and resolved positions to determine real P&L.
+        """
+        unresolved = self.db.get_unresolved_trades()
+        if not unresolved:
+            return
+
+        try:
+            fills = self.kalshi_reader.get_fills(limit=200)
+        except Exception as e:
+            logger.error(f"Failed to fetch fills for settlement: {e}")
+            return
+
+        # Build a map of ticker -> total filled info
+        fill_map = {}
+        for fill in fills:
+            ticker = fill.get("ticker", "")
+            if ticker not in fill_map:
+                fill_map[ticker] = []
+            fill_map[ticker].append(fill)
+
+        for trade in unresolved:
+            ticker = trade["ticker"]
+
+            # Check if this market has settled by looking at the market status
+            try:
+                market = self.kalshi_reader.get_market(ticker)
+                status = market.get("status", "")
+                result = market.get("result", "")
+
+                if status not in ("settled", "finalized"):
+                    continue  # market still open, skip
+
+                # Market is settled — calculate real P&L
+                side = trade["side"]
+                price_cents = trade["price"]
+                size = trade["size"]
+                cost = price_cents * size / 100
+
+                if side == result:
+                    pnl = size - cost  # won
+                else:
+                    pnl = -cost  # lost
+
+                self.trade_logger.update_pnl(trade["id"], pnl)
+                logger.info(
+                    f"Live settlement: trade {trade['id']} {ticker} {side} @ {price_cents}c x{int(size)} | "
+                    f"result={result} PnL=${pnl:.2f}"
+                )
+                try:
+                    send_settlement_alert(
+                        ticker=ticker,
+                        side=side,
+                        result=result,
+                        pnl=pnl,
+                        price=price_cents,
+                        size=int(size),
+                    )
+                except Exception as e:
+                    logger.warning(f"Discord settlement alert failed: {e}")
+
+            except Exception as e:
+                logger.debug(f"Cannot check settlement for {ticker}: {e}")
+                continue
 
     async def _dashboard_loop(self):
         """Periodically update dashboard data."""
-        try:
-            while self.running:
+        while self.running:
+            try:
                 trades_df = self.db.get_recent_trades(limit=100)
                 total = len(trades_df)
                 wins = len(trades_df[trades_df["pnl"] > 0]) if not trades_df.empty and "pnl" in trades_df else 0
@@ -789,14 +1043,20 @@ class TradingSystem:
                             "pnl": row.get("pnl"),
                         })
 
-                # Next expiry
+                # Next expiry — close_time is ISO string from Kalshi API
                 next_expiry = ""
                 if self._current_market:
-                    exp_ms = self._current_market.get("close_time", 0)
-                    if exp_ms:
-                        exp_dt = datetime.fromtimestamp(exp_ms / 1000, tz=timezone.utc)
-                        remaining = (exp_dt - datetime.now(timezone.utc)).total_seconds()
-                        next_expiry = f"{int(remaining // 60)}m {int(remaining % 60)}s"
+                    close_time_str = self._current_market.get("close_time", "")
+                    if close_time_str and isinstance(close_time_str, str):
+                        try:
+                            exp_dt = datetime.fromisoformat(close_time_str.replace("Z", "+00:00"))
+                            remaining = (exp_dt - datetime.now(timezone.utc)).total_seconds()
+                            if remaining > 0:
+                                next_expiry = f"{int(remaining // 60)}m {int(remaining % 60)}s"
+                            else:
+                                next_expiry = "EXPIRED"
+                        except (ValueError, TypeError):
+                            pass
 
                 self.dashboard.update(
                     mode=self.mode,
@@ -810,10 +1070,12 @@ class TradingSystem:
                     next_expiry=next_expiry,
                     recent_trades=recent,
                 )
+            except asyncio.CancelledError:
+                return
+            except Exception as e:
+                logger.error(f"Dashboard loop error: {e}", exc_info=True)
 
-                await asyncio.sleep(5)
-        except asyncio.CancelledError:
-            pass
+            await asyncio.sleep(5)
 
     async def _shutdown(self):
         """Graceful shutdown."""
@@ -860,16 +1122,46 @@ def main():
                         help="Path to config file")
     args = parser.parse_args()
 
-    logging.basicConfig(
-        level=logging.INFO,
-        format="%(asctime)s %(levelname)s %(name)s: %(message)s",
-    )
+    log_format = "%(asctime)s %(levelname)s %(name)s: %(message)s"
+    logging.basicConfig(level=logging.INFO, format=log_format)
+
+    # Also write to log file directly (unbuffered)
+    from pathlib import Path
+    Path("logs").mkdir(exist_ok=True)
+    file_handler = logging.FileHandler("logs/live.log", mode="a")
+    file_handler.setLevel(logging.INFO)
+    file_handler.setFormatter(logging.Formatter(log_format))
+    logging.getLogger().addHandler(file_handler)
 
     cfg = load_config(args.config)
     if args.mode:
         cfg["mode"] = args.mode
         if args.mode == "live":
             cfg["kalshi"]["base_url"] = cfg["kalshi"]["live_url"]
+
+    # Live mode safety checks
+    if cfg["mode"] == "live":
+        from pathlib import Path
+        api_key = cfg["kalshi"].get("api_key_id", "")
+        pk_path = cfg["kalshi"].get("private_key_path", "")
+        if not api_key or api_key.startswith("your-"):
+            print("ERROR: Live mode requires real API credentials in .env")
+            sys.exit(1)
+        if not pk_path or not Path(pk_path).exists():
+            print(f"ERROR: Private key not found at: {pk_path}")
+            sys.exit(1)
+        # Confirm with user before starting live trading
+        print(f"\n*** LIVE TRADING MODE ***")
+        print(f"  API Key: {api_key[:8]}...{api_key[-4:]}")
+        print(f"  Max position: ${cfg['risk']['max_position_size']}")
+        print(f"  Max exposure: ${cfg['risk']['max_total_exposure']}")
+        print(f"  Max daily loss: ${cfg['risk']['max_daily_loss']}")
+        print(f"  Edge threshold: {cfg['strategy']['edge_threshold']:.0%}")
+        print(f"  Kelly fraction: {cfg['strategy']['kelly_fraction']}")
+        confirm = input("\nType 'YES' to confirm live trading: ")
+        if confirm.strip() != "YES":
+            print("Aborted.")
+            sys.exit(0)
 
     system = TradingSystem(cfg)
 

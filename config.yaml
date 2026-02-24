@@ -15,14 +15,15 @@ binance:
   interval: "15m"
 
 strategy:
-  edge_threshold: 0.02        # minimum edge to trade (2%)
+  edge_threshold: 0.04        # minimum edge to trade (4% — conservative for live)
   vol_model_lookback: 20       # candles for vol feature computation
-  kelly_fraction: 1.0         # full Kelly
-  full_kelly_edge: 0.05       # edge at which full Kelly kicks in (ramp from 0.25x at threshold)
+  kelly_fraction: 0.5         # half Kelly — safer for small bankroll
+  full_kelly_edge: 0.10       # edge at which full Kelly kicks in (ramp from 0.25x at threshold)
   momentum_lookback: 4        # candles for momentum (all must agree)
   mean_reversion_threshold: 0.004  # 0.4% move threshold
   vol_regime_window: 20       # candles for vol regime
   funding_weight: 0.1         # funding rate signal weight
+  trade_before_close_sec: 900 # evaluate 15 min before market close (matches vol model training)
   min_agreeing_signals: 1     # require model + 1 confirming strategy
   active_strategies:
     - momentum
@@ -31,11 +32,11 @@ strategy:
     - funding_rate
 
 risk:
-  max_position_size: 5000     # $ per trade — safety net, not binding constraint
-  max_total_exposure: 5000    # $ total
-  max_daily_loss: 2000        # $ daily loss limit
-  max_daily_trades_per_bracket: 4  # max trades per ticker per day to avoid overconcentration
-  cancel_before_expiry_sec: 120  # cancel open orders 2 min before expiry
+  max_position_size: 50       # $ per trade — 10% of $500 bankroll
+  max_total_exposure: 150     # $ total — 30% of bankroll across all positions
+  max_daily_loss: 50          # $ daily loss limit — 10% of bankroll
+  max_daily_trades_per_bracket: 3  # max trades per ticker per day to avoid overconcentration
+  cancel_before_expiry_sec: 15   # cancel open orders 15s before expiry (gives ~100s to fill)
 
 polling:
   binance_interval_sec: 10
@@ -43,6 +44,9 @@ polling:
 
 database:
   path: "data/trader.db"
+
+discord:
+  webhook_url: "https://discord.com/api/webhooks/1475002111346479336/ITC0-iRp9ODybDRNqJ01SnIbIoiorgpk-iWjQp_jCxXCaEo1YpKxqAjcqIzKYnW2qEB_"
 
 logging:
   level: "INFO"
