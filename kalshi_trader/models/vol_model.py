@@ -26,9 +26,10 @@ class VolModel:
     This directly maps to whether price stays in a bracket or not.
     """
 
-    def __init__(self, lookback: int = 20, shrinkage: float = 0.3):
+    def __init__(self, lookback: int = 20, shrinkage: float = 0.3, vol_floor_ratio: float = 0.5):
         self.lookback = lookback
         self.shrinkage = shrinkage  # how much to trust model vs market
+        self.vol_floor_ratio = vol_floor_ratio  # blended vol can't be less than this * implied
         self.model = GradientBoostingRegressor(
             n_estimators=100,
             max_depth=3,
@@ -147,62 +148,11 @@ class VolModel:
         self.optimize_shrinkage(candles, funding_rate)
 
     def optimize_shrinkage(self, candles: pd.DataFrame, funding_rate: float = 0.0):
-        """Find optimal shrinkage via train/test split.
-
-        Sweeps shrinkage from 0.1 to 1.0 and picks the value that minimizes
-        MAE of blended vol predictions vs actual realized vol on a held-out test set.
+        """Disabled: previous implementation used median(y_test) as implied vol proxy,
+        which is wrong units and actively harmful. Will be re-enabled in Phase 3
+        once we have real (predicted, implied, realized) triples from the evaluations table.
         """
-        if not self._fitted:
-            return
-
-        X = self._compute_features(candles, funding_rate)
-        y = candles["close"].pct_change().shift(-1).abs().values
-
-        valid = ~(np.isnan(X).any(axis=1)) & ~np.isnan(y)
-        valid[-1] = False
-        X = X[valid]
-        y = y[valid]
-
-        if len(X) < 100:
-            logger.warning("Not enough data for shrinkage optimization")
-            return
-
-        # 70/30 train/test split (chronological — no shuffling)
-        split = int(len(X) * 0.7)
-        X_test = X[split:]
-        y_test = y[split:]
-
-        if len(X_test) < 20:
-            logger.warning("Test set too small for shrinkage optimization")
-            return
-
-        X_test_scaled = self.scaler.transform(X_test)
-        raw_preds = self.model.predict(X_test_scaled)
-        raw_preds = np.maximum(raw_preds, 0.0005)
-
-        # Use median predicted vol as a proxy for implied vol in this sweep
-        implied_proxy = float(np.median(y_test))
-
-        results = []
-        for s_int in range(1, 11):
-            s = s_int / 10.0
-            blended = implied_proxy + s * (raw_preds - implied_proxy)
-            blended = np.maximum(blended, 0.0005)
-            mae = float(np.mean(np.abs(y_test - blended)))
-            results.append((s, mae))
-
-        # Log full results table
-        header = "Shrinkage optimization results:"
-        rows = "\n".join(f"  shrinkage={s:.1f}  MAE={mae:.6f}" for s, mae in results)
-        logger.info(f"{header}\n{rows}")
-
-        # Pick the shrinkage with lowest MAE
-        best_s, best_mae = min(results, key=lambda x: x[1])
-        old_s = self.shrinkage
-        self.shrinkage = best_s
-        logger.info(
-            f"Shrinkage optimized: {old_s:.1f} -> {best_s:.1f} (MAE={best_mae:.6f})"
-        )
+        logger.info(f"Shrinkage optimization disabled — using fixed shrinkage={self.shrinkage}")
 
     def predict(self, candles: pd.DataFrame, funding_rate: float = 0.0) -> float:
         """Predict next-candle realized vol (absolute return).
@@ -231,9 +181,13 @@ class VolModel:
         etc. We only trust our deviation from the market by `shrinkage` amount.
 
         shrinkage=0.3 → blended = implied + 0.3 * (predicted - implied)
+
+        A floor prevents blended vol from being less than vol_floor_ratio * implied,
+        capping the maximum phantom edge from model underestimation.
         """
         blended = implied_vol + self.shrinkage * (predicted_vol - implied_vol)
-        return float(max(blended, 0.0005))
+        floor = implied_vol * self.vol_floor_ratio
+        return float(max(blended, floor, 0.0005))
 
     def save(self, path: str):
         with open(path, "wb") as f:

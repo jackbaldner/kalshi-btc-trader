@@ -60,7 +60,10 @@ class TradingSystem:
 
         # Strategy
         self.ensemble = EnsembleStrategy(cfg)
-        self.vol_model = VolModel(lookback=cfg["strategy"].get("vol_model_lookback", 20))
+        self.vol_model = VolModel(
+            lookback=cfg["strategy"].get("vol_model_lookback", 20),
+            vol_floor_ratio=cfg["strategy"].get("vol_floor_ratio", 0.5),
+        )
 
         # Execution
         self.order_manager = OrderManager(self.kalshi, cfg)
@@ -100,7 +103,7 @@ class TradingSystem:
         logger.info(f"Starting trading system in {self.mode} mode")
 
         # Load candles: try DB first (from backtest), then fetch fresh
-        self._candles = self.db.get_candles(limit=500)
+        self._candles = self.db.get_candles(limit=10000)
         logger.info(f"Loaded {len(self._candles)} candles from database")
 
         if len(self._candles) < 100:
@@ -108,7 +111,22 @@ class TradingSystem:
             fresh = await self.binance.get_klines(limit=100)
             if not fresh.empty:
                 self.db.upsert_candles(fresh)
-                self._candles = self.db.get_candles(limit=500)
+                self._candles = self.db.get_candles(limit=10000)
+
+        # One-time backfill: fetch 180 days of history if DB is sparse
+        if len(self._candles) < 17000:
+            logger.info(
+                f"Backfilling historical candles (have {len(self._candles)}, "
+                f"target ~17,000 for 180 days)..."
+            )
+            try:
+                historical = await self.binance.get_historical_klines(days=180)
+                if not historical.empty:
+                    self.db.upsert_candles(historical)
+                    self._candles = self.db.get_candles(limit=10000)
+                    logger.info(f"Backfilled to {len(self._candles)} candles in DB")
+            except Exception as e:
+                logger.warning(f"Historical backfill failed (non-fatal): {e}")
 
         # Train models
         if len(self._candles) >= 50:
@@ -241,7 +259,7 @@ class TradingSystem:
             new_candles = await self.binance.get_klines(limit=5)
             if not new_candles.empty:
                 self.db.upsert_candles(new_candles)
-                self._candles = self.db.get_candles(limit=100)
+                self._candles = self.db.get_candles(limit=500)
 
             self._funding_rate = await self.binance.get_funding_rate()
 

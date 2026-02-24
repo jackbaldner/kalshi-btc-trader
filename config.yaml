@@ -23,6 +23,7 @@ strategy:
   mean_reversion_threshold: 0.004  # 0.4% move threshold
   vol_regime_window: 20       # candles for vol regime
   funding_weight: 0.1         # funding rate signal weight
+  vol_floor_ratio: 0.5        # blended vol can't be less than 50% of implied vol
   trade_before_close_sec: 900 # evaluate 15 min before market close (matches vol model training)
   min_agreeing_signals: 1     # require model + 1 confirming strategy
   active_strategies:
