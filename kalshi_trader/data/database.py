@@ -84,11 +84,31 @@ CREATE TABLE IF NOT EXISTS evaluations (
     resolved INTEGER DEFAULT 0
 );
 
+CREATE TABLE IF NOT EXISTS deribit_snapshots (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    timestamp INTEGER,
+    dvol_open REAL,
+    dvol_high REAL,
+    dvol_low REAL,
+    dvol_close REAL,
+    perp_funding_8h REAL,
+    perp_current_funding REAL,
+    perp_open_interest REAL,
+    perp_mark_price REAL,
+    perp_index_price REAL,
+    atm_call_iv REAL,
+    atm_put_iv REAL,
+    put_call_skew REAL,
+    nearest_expiry TEXT,
+    atm_strike REAL
+);
+
 CREATE INDEX IF NOT EXISTS idx_candles_time ON candles(open_time);
 CREATE INDEX IF NOT EXISTS idx_trades_time ON trades(timestamp);
 CREATE INDEX IF NOT EXISTS idx_snapshots_time ON kalshi_snapshots(timestamp);
 CREATE INDEX IF NOT EXISTS idx_evaluations_time ON evaluations(timestamp);
 CREATE INDEX IF NOT EXISTS idx_evaluations_resolved ON evaluations(resolved);
+CREATE INDEX IF NOT EXISTS idx_deribit_time ON deribit_snapshots(timestamp);
 """
 
 
@@ -237,3 +257,31 @@ class Database:
             (timestamp, strategy, direction, confidence, json.dumps(features)),
         )
         self.conn.commit()
+
+    # -- Deribit Snapshots --
+    def insert_deribit_snapshot(self, timestamp: int, dvol: dict, perpetual: dict, options: dict):
+        """Insert a Deribit data snapshot from the three API responses."""
+        self.conn.execute(
+            "INSERT INTO deribit_snapshots (timestamp, dvol_open, dvol_high, dvol_low, dvol_close, "
+            "perp_funding_8h, perp_current_funding, perp_open_interest, perp_mark_price, perp_index_price, "
+            "atm_call_iv, atm_put_iv, put_call_skew, nearest_expiry, atm_strike) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            (
+                timestamp,
+                dvol.get("open"), dvol.get("high"), dvol.get("low"), dvol.get("close"),
+                perpetual.get("funding_8h"), perpetual.get("current_funding"),
+                perpetual.get("open_interest"), perpetual.get("mark_price"),
+                perpetual.get("index_price"),
+                options.get("atm_call_iv"), options.get("atm_put_iv"),
+                options.get("put_call_skew"), options.get("nearest_expiry"),
+                options.get("strike"),
+            ),
+        )
+        self.conn.commit()
+
+    def get_deribit_snapshots(self, limit: int = 100) -> pd.DataFrame:
+        """Get most recent Deribit snapshots."""
+        return pd.read_sql_query(
+            f"SELECT * FROM deribit_snapshots ORDER BY timestamp DESC LIMIT {limit}",
+            self.conn,
+        )

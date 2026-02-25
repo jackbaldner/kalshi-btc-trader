@@ -49,6 +49,9 @@ database:
 discord:
   webhook_url: "https://discord.com/api/webhooks/1475002111346479336/ITC0-iRp9ODybDRNqJ01SnIbIoiorgpk-iWjQp_jCxXCaEo1YpKxqAjcqIzKYnW2qEB_"
 
+deribit:
+  base_url: "https://www.deribit.com/api/v2"
+
 logging:
   level: "INFO"
   trade_csv: "data/trades.csv"

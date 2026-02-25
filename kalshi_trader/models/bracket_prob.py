@@ -128,6 +128,7 @@ def estimate_bracket_prob_from_vol(
     bracket_high: float,
     predicted_vol: float,
     model_p_up: float = 0.5,
+    raw_model_vol: float = 0.0,
 ) -> float:
     """Estimate bracket probability using our predicted volatility.
 
@@ -170,14 +171,16 @@ def estimate_bracket_prob_from_vol(
     # a conservative baseline (reduces false edge on cheap OTM brackets).
     bracket_mid = (bracket_low + bracket_high) / 2
     distance = abs(bracket_mid - current_price) / current_price  # as fraction
-    # distance_in_sigmas: how many predicted-vol units away is this bracket
-    distance_in_sigmas = distance / max(predicted_vol, 0.0005)
+    # distance_in_sigmas: use raw (unblended) model vol so OTM brackets
+    # aren't made to look close by high implied vol bleeding into the blend
+    vol_for_distance = raw_model_vol if raw_model_vol > 0 else predicted_vol
+    distance_in_sigmas = distance / max(vol_for_distance, 0.0005)
 
     if distance_in_sigmas > 1.0:
         # Shrink our prob toward zero for far-out brackets.
         # At 1 sigma: no penalty. At 2+ sigma: heavy penalty.
-        # trust_factor decays from 1.0 at 1σ to ~0.3 at 3σ
-        trust_factor = 1.0 / (1.0 + 0.5 * (distance_in_sigmas - 1.0))
+        # trust_factor decays from 1.0 at 1σ to ~0.2 at 2σ (aggressive decay)
+        trust_factor = 1.0 / (1.0 + 1.0 * (distance_in_sigmas - 1.0))
         adjusted_prob = prob * trust_factor
         if adjusted_prob != prob:
             logger.debug(

@@ -5,7 +5,7 @@ from pathlib import Path
 
 bot_dir = Path(__file__).parent
 proc = subprocess.Popen(
-    [sys.executable, "run.py", "--no-dashboard"],
+    [sys.executable, "run.py", "--mode", "live", "--no-dashboard"],
     cwd=str(bot_dir),
     stdin=subprocess.PIPE,
     stdout=subprocess.DEVNULL,

@@ -12,6 +12,7 @@ from kalshi_trader.config import load_config
 from kalshi_trader.dashboard.cli import Dashboard
 from kalshi_trader.data.binance import BinanceClient
 from kalshi_trader.data.database import Database
+from kalshi_trader.data.deribit import DeribitClient
 from kalshi_trader.data.kalshi_client import KalshiClient
 from kalshi_trader.data.kalshi_mock import KalshiMock
 from kalshi_trader.data.kalshi_ws import KalshiWebSocket
@@ -49,6 +50,7 @@ class TradingSystem:
 
         # Data
         self.binance = BinanceClient(cfg)
+        self.deribit = DeribitClient(cfg)
         self.db = Database(cfg["database"]["path"])
 
         # Kalshi clients
@@ -103,6 +105,7 @@ class TradingSystem:
         self._trained = False
         self._last_trade_window = ""  # dedup key: event close time
         self._event_close_time = None  # ISO timestamp of current event close
+        self._last_deribit_poll = 0
 
     async def start(self):
         """Initialize and start the trading loop."""
@@ -186,6 +189,11 @@ class TradingSystem:
                 if now - self._last_kalshi_poll >= kalshi_interval:
                     await self._poll_kalshi()
                     self._last_kalshi_poll = now
+
+                # Poll Deribit (options/vol data, 60s interval)
+                if now - self._last_deribit_poll >= 60:
+                    await self._poll_deribit()
+                    self._last_deribit_poll = now
 
                 # Settle expired trades and resolve evaluations
                 if now - self._last_settlement_check >= self._settlement_interval:
@@ -272,7 +280,7 @@ class TradingSystem:
             new_candles = await self.binance.get_klines(limit=5)
             if not new_candles.empty:
                 self.db.upsert_candles(new_candles)
-                self._candles = self.db.get_candles(limit=500)
+                self._candles = self.db.get_candles(limit=10000)
 
             self._funding_rate = await self.binance.get_funding_rate()
 
@@ -521,6 +529,7 @@ class TradingSystem:
             predicted_vol = self.vol_model.blend_with_implied(raw_pred_vol, implied_vol)
             bracket_prob = estimate_bracket_prob_from_vol(
                 self._btc_price, bracket[0], bracket[1], predicted_vol, model_prob,
+                raw_model_vol=raw_pred_vol,
             )
             logger.info(
                 f"Vol: raw={raw_pred_vol:.5f} blended={predicted_vol:.5f} "
@@ -1245,6 +1254,33 @@ class TradingSystem:
 
             await asyncio.sleep(5)
 
+    async def _poll_deribit(self):
+        """Fetch Deribit options/vol data and log to DB."""
+        try:
+            dvol, perpetual, options = await asyncio.gather(
+                self.deribit.get_dvol(),
+                self.deribit.get_perpetual_ticker(),
+                self.deribit.get_options_summary(),
+            )
+
+            # Log summary
+            dvol_val = dvol.get("close", 0)
+            funding = perpetual.get("current_funding", 0)
+            oi = perpetual.get("open_interest", 0)
+            skew = options.get("put_call_skew", 0)
+            logger.info(
+                f"Deribit: DVOL={dvol_val:.1f}% "
+                f"perp_funding={funding:.4f}% "
+                f"OI=${oi / 1e6:.1f}M "
+                f"skew={skew:.2f}%"
+            )
+
+            # Store snapshot
+            ts = int(time.time() * 1000)
+            self.db.insert_deribit_snapshot(ts, dvol, perpetual, options)
+        except Exception as e:
+            logger.warning(f"Deribit poll failed (non-fatal): {e}")
+
     async def _shutdown(self):
         """Graceful shutdown."""
         logger.info("Shutting down...")
@@ -1253,6 +1289,7 @@ class TradingSystem:
         self.order_manager.cleanup()
         await self.kalshi_ws.close()
         await self.binance.close()
+        await self.deribit.close()
         if hasattr(self.kalshi, "close"):
             self.kalshi.close()
         if hasattr(self.kalshi_reader, "close"):
