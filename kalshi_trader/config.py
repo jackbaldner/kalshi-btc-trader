@@ -31,6 +31,11 @@ def load_config(config_path: str = "config.yaml") -> dict:
     if env_url:
         cfg["kalshi"]["base_url"] = env_url
 
+    # Discord webhook from env (overrides config.yaml)
+    discord_url = os.getenv("DISCORD_WEBHOOK_URL")
+    if discord_url:
+        cfg.setdefault("discord", {})["webhook_url"] = discord_url
+
     # Ensure data directory exists
     db_path = project_root / cfg["database"]["path"]
     db_path.parent.mkdir(parents=True, exist_ok=True)
