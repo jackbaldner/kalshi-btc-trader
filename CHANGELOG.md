@@ -1,5 +1,19 @@
 # Changelog
 
+## 2026-02-25 (evening)
+
+### Fix NO-side pricing bug in `_get_realistic_price`
+- **What:** NO-side edge check was using `(100 - fill_price)` instead of `fill_price` for the cost, making every NO price look like it had massive edge. Example: 87c NO showed 69% edge instead of -5%.
+- **Why:** Bug caused the bot to accept any NO fill price on the book, even when paying more than the model's win probability justifies.
+- **Fix:** Changed `effective_implied = (100 - fill_price) / 100.0` to `fill_price / 100.0` for NO side, mirroring the YES logic.
+- **Rollback:** Change `effective_implied = fill_price / 100.0` back to `(100 - fill_price) / 100.0` in the NO branch of `_get_realistic_price` (but don't — it was wrong)
+
+### Cap NO price at 50c
+- **What:** NO orders above 50c are now rejected. Configurable via `risk.max_no_price_cents`.
+- **Why:** Over 36 NO-edge evals, expensive NOs (75c+) lost money despite 75% win rate — the risk/reward is too lopsided (risk 85c to win 15c). Cheap NOs (<50c) were the only profitable bucket.
+- **Data:** Expensive NO (75c+): 24 trades, 75% win, -$0.10/contract. Cheap NO (<50c): 2 trades, 50% win, +$0.14/contract.
+- **Rollback:** Remove the `max_no_price_cents` check in `run.py` or set to 99 in config.yaml
+
 ## 2026-02-25
 
 ### Shrinkage 0.3 -> 0.4

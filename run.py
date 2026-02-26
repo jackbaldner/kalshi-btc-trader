@@ -608,6 +608,12 @@ class TradingSystem:
             logger.info(f"No fillable price with edge for {result.side} on {ticker} — skipping")
             return
 
+        # Cap NO price — expensive NOs have terrible risk/reward
+        max_no_price = self.cfg["risk"].get("max_no_price_cents", 50)
+        if result.side == "no" and price_cents > max_no_price:
+            logger.info(f"NO price {price_cents}c exceeds cap {max_no_price}c — skipping")
+            return
+
         order_size = result.contracts
         if order_size <= 0:
             return
@@ -768,7 +774,7 @@ class TradingSystem:
                 effective_implied = fill_price / 100.0
                 remaining_edge = model_prob - effective_implied
             else:
-                effective_implied = (100 - fill_price) / 100.0
+                effective_implied = fill_price / 100.0
                 remaining_edge = (1 - model_prob) - effective_implied
 
             if remaining_edge >= edge_threshold:
@@ -784,7 +790,7 @@ class TradingSystem:
         if side == "yes":
             best_edge = model_prob - best_ask / 100.0
         else:
-            best_edge = (1 - model_prob) - (100 - best_ask) / 100.0
+            best_edge = (1 - model_prob) - best_ask / 100.0
         logger.info(
             f"No edge at any ask: best_ask={best_ask}c edge_at_best={best_edge:.4f} "
             f"(need {edge_threshold})"
