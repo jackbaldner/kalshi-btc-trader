@@ -26,7 +26,7 @@ class VolModel:
     This directly maps to whether price stays in a bracket or not.
     """
 
-    def __init__(self, lookback: int = 20, shrinkage: float = 0.3, vol_floor_ratio: float = 0.5):
+    def __init__(self, lookback: int = 20, shrinkage: float = 0.4, vol_floor_ratio: float = 0.5):
         self.lookback = lookback
         self.shrinkage = shrinkage  # how much to trust model vs market
         self.vol_floor_ratio = vol_floor_ratio  # blended vol can't be less than this * implied
