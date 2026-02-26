@@ -1,5 +1,13 @@
 # Changelog
 
+## 2026-02-26
+
+### Fix NO-side fill pricing double-flip bug
+- **What:** `_get_realistic_price` used `(1 - model_prob)` for NO-side edge calculation, but `ensemble_prob` is already flipped to the NO probability for NO trades. This double-flipped it back to YES probability, then compared against the NO fill cost — producing deeply negative edge at every price.
+- **Impact:** Blocked ALL NO-side orderbook fills. 47 overnight evals flagged `should_trade=1` but 0 orders placed — every one hit "No fillable price with edge". Example: [67,250–67,500] bracket had 6.9% NO edge but showed `edge_at_best=-0.5444` at 64c ask.
+- **Fix:** Changed `(1 - model_prob) - effective_implied` to `model_prob - effective_implied` for NO side, matching YES logic (both now: our probability minus fill cost).
+- **Rollback:** Change `model_prob - effective_implied` back to `(1 - model_prob) - effective_implied` in the NO branches of `_get_realistic_price` (but don't — it was wrong)
+
 ## 2026-02-25 (evening)
 
 ### Fix NO-side pricing bug in `_get_realistic_price`
