@@ -775,7 +775,7 @@ class TradingSystem:
                 remaining_edge = model_prob - effective_implied
             else:
                 effective_implied = fill_price / 100.0
-                remaining_edge = (1 - model_prob) - effective_implied
+                remaining_edge = model_prob - effective_implied
 
             if remaining_edge >= edge_threshold:
                 total_depth = sum(q for p, q in ask_levels if p <= fill_price)
@@ -790,7 +790,7 @@ class TradingSystem:
         if side == "yes":
             best_edge = model_prob - best_ask / 100.0
         else:
-            best_edge = (1 - model_prob) - best_ask / 100.0
+            best_edge = model_prob - best_ask / 100.0
         logger.info(
             f"No edge at any ask: best_ask={best_ask}c edge_at_best={best_edge:.4f} "
             f"(need {edge_threshold})"
