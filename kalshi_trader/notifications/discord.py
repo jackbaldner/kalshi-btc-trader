@@ -125,6 +125,52 @@ def send_settlement_alert(
         logger.warning(f"Discord settlement alert failed: {e}")
 
 
+def send_eval_summary(
+    *,
+    btc_price: float,
+    event_ticker: str,
+    brackets_evaluated: int,
+    best_edge: float,
+    best_edge_bracket: str,
+    trades_attempted: int,
+    trades_filled: int,
+) -> None:
+    """Send a summary embed after each eval cycle (hourly heartbeat)."""
+    if not _webhook_url:
+        return
+    try:
+        if trades_filled > 0:
+            color = 0x2ECC71  # green — trade filled
+        elif trades_attempted > 0:
+            color = 0xF1C40F  # yellow — edge found, no fill
+        else:
+            color = 0x3498DB  # blue — no action
+
+        if trades_filled > 0:
+            outcome = f"{trades_filled} filled"
+        elif trades_attempted > 0:
+            outcome = f"{trades_attempted} attempted, 0 filled"
+        else:
+            outcome = "No edge found"
+
+        embed = {
+            "title": "Eval Summary",
+            "color": color,
+            "fields": [
+                {"name": "BTC Price", "value": f"${btc_price:,.0f}", "inline": True},
+                {"name": "Event", "value": event_ticker or "N/A", "inline": True},
+                {"name": "Brackets", "value": str(brackets_evaluated), "inline": True},
+                {"name": "Best Edge", "value": f"{best_edge:.2%}" if best_edge else "N/A", "inline": True},
+                {"name": "Best Bracket", "value": best_edge_bracket or "N/A", "inline": True},
+                {"name": "Outcome", "value": outcome, "inline": True},
+            ],
+            "timestamp": datetime.now(timezone.utc).isoformat(),
+        }
+        _post_embed(embed)
+    except Exception as e:
+        logger.warning(f"Discord eval summary failed: {e}")
+
+
 def send_startup_alert(
     *,
     mode: str,

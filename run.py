@@ -195,8 +195,9 @@ class TradingSystem:
                     await self._poll_deribit()
                     self._last_deribit_poll = now
 
-                # Settle expired trades and resolve evaluations
+                # Settle expired trades, check late fills, resolve evaluations
                 if now - self._last_settlement_check >= self._settlement_interval:
+                    await self._check_resting_fills()
                     await self._settle_trades()
                     await self._resolve_evaluations()
                     self.order_manager.cancel_stale_orders()
@@ -469,6 +470,7 @@ class TradingSystem:
         except Exception as e:
             logger.error(f"Failed to fetch balance, skipping evaluation: {e}")
             return
+
         for market, bracket in brackets_to_eval:
             await self._evaluate_single_bracket(market, bracket, balance)
             # Refresh balance after each trade so Kelly sizing adapts
@@ -481,13 +483,16 @@ class TradingSystem:
         # Mark this window as evaluated only after successful completion
         self._last_trade_window = close_key
 
-    async def _evaluate_single_bracket(self, market: dict, bracket: tuple, balance: float):
-        """Evaluate and potentially trade a single bracket."""
+    async def _evaluate_single_bracket(self, market: dict, bracket: tuple, balance: float) -> dict | None:
+        """Evaluate and potentially trade a single bracket.
+
+        Returns a dict with eval info (edge, bracket, trade outcome) or None if skipped by dedup.
+        """
         ticker = market["ticker"]
 
         # Per-bracket dedup: don't re-trade same ticker within an hour
         if ticker in self._traded_brackets_this_window:
-            return
+            return None
         one_hour_ago_ms = int((datetime.now(timezone.utc) - timedelta(hours=1)).timestamp() * 1000)
         existing = self.db.conn.execute(
             "SELECT COUNT(*) as c FROM trades WHERE timestamp >= ? AND ticker = ?",
@@ -495,7 +500,7 @@ class TradingSystem:
         ).fetchone()
         if existing["c"] > 0:
             logger.debug(f"Already traded {ticker} within the last hour, skipping")
-            return
+            return None
 
         # Per-bracket daily limit: avoid overconcentration on one ticker
         max_daily_per_bracket = self.cfg["risk"].get("max_daily_trades_per_bracket", 4)
@@ -509,7 +514,7 @@ class TradingSystem:
             logger.info(
                 f"Daily limit reached for {ticker}: {daily_count['c']}/{max_daily_per_bracket} trades today, skipping"
             )
-            return
+            return None
 
         # Build market data for this bracket
         yes_bid = market.get("yes_bid", 50)
@@ -580,9 +585,16 @@ class TradingSystem:
         except Exception as e:
             logger.warning(f"Failed to log evaluation: {e}")
 
+        eval_info = {
+            "edge": edge,
+            "bracket": f"[{bracket[0]:,.0f}-{bracket[1]:,.0f}]",
+            "trade_attempted": False,
+            "filled": False,
+        }
+
         if not result.should_trade:
             logger.info(f"No edge for [{bracket[0]:,.0f}-{bracket[1]:,.0f}] — skipping")
-            return
+            return eval_info
 
         # Use freshest orderbook available before trading
         if self.kalshi_ws.is_ready and self.kalshi_ws.age_seconds < 2:
@@ -606,17 +618,17 @@ class TradingSystem:
         )
         if price_cents is None:
             logger.info(f"No fillable price with edge for {result.side} on {ticker} — skipping")
-            return
+            return eval_info
 
         # Cap NO price — expensive NOs have terrible risk/reward
         max_no_price = self.cfg["risk"].get("max_no_price_cents", 50)
         if result.side == "no" and price_cents > max_no_price:
             logger.info(f"NO price {price_cents}c exceeds cap {max_no_price}c — skipping")
-            return
+            return eval_info
 
         order_size = result.contracts
         if order_size <= 0:
-            return
+            return eval_info
 
         # Liquidity check: cap order size to 50% of available book depth
         max_liquidity_pct = self.cfg["risk"].get("max_book_take_pct", 0.5)
@@ -629,7 +641,7 @@ class TradingSystem:
             order_size = capped_size
 
         if order_size <= 0:
-            return
+            return eval_info
 
         logger.info(
             f"Order plan: {result.side} {order_size}x {ticker} @ {price_cents}c "
@@ -640,7 +652,7 @@ class TradingSystem:
         allowed, reason = self.risk.check_order(result.side, price_cents, order_size, balance)
         if not allowed:
             logger.info(f"Trade blocked by risk: {reason}")
-            return
+            return eval_info
 
         # Calculate fill confidence before placing order
         fill_confidence = self._estimate_fill_confidence(
@@ -648,6 +660,7 @@ class TradingSystem:
         )
 
         # Place order
+        eval_info["trade_attempted"] = True
         try:
             order = self.order_manager.place_order(
                 ticker, result.side, price_cents, order_size,
@@ -655,7 +668,7 @@ class TradingSystem:
             )
         except Exception as e:
             logger.error(f"Order placement failed for {ticker}: {e}")
-            return
+            return eval_info
 
         if order and "error" not in order:
             order_id = order.get("order_id") or order.get("order", {}).get("order_id")
@@ -663,6 +676,16 @@ class TradingSystem:
             status = order_obj.get("status", "")
             filled_count = order_obj.get("fill_count", 0)
             remaining = order_obj.get("remaining_count", order_size)
+
+            # Store metadata for late fill detection
+            if order_id and order_id in self.order_manager._open_orders:
+                self.order_manager._open_orders[order_id].update({
+                    "bracket_low": bracket[0],
+                    "bracket_high": bracket[1],
+                    "edge": result.edge,
+                    "predicted_vol": predicted_vol,
+                    "implied_vol": implied_vol,
+                })
 
             if filled_count == 0 and order_id and status not in ("canceled", "cancelled"):
                 # Order not immediately filled — wait briefly and recheck
@@ -677,6 +700,8 @@ class TradingSystem:
                     logger.warning(f"Failed to recheck order {order_id}: {e}")
 
             if filled_count > 0:
+                eval_info["filled"] = True
+                self.order_manager.mark_filled(order_id)
                 # Order filled (fully or partially) — log the trade
                 fill_price = order_obj.get("yes_price", price_cents)
                 logger.info(
@@ -737,6 +762,8 @@ class TradingSystem:
                 self.risk.update_exposure(positions)
             except Exception as e:
                 logger.warning(f"Failed to update exposure after trade: {e}")
+
+        return eval_info
 
     def _get_realistic_price(self, book: dict, side: str, edge: float,
                                model_prob: float) -> tuple[int | None, int]:
@@ -1022,6 +1049,91 @@ class TradingSystem:
                               ).timestamp() * 1000) + 60_000])
         if resolved_count > 0:
             logger.info(f"Resolved {resolved_count} evaluations with realized vol data")
+
+    async def _check_resting_fills(self):
+        """Detect late fills on resting orders via the Kalshi fills API.
+
+        Orders that were resting at recheck time may have filled later.
+        This catches those fills, logs them to the DB, and sends Discord alerts.
+        """
+        if self.mode != "live":
+            return
+
+        try:
+            fills = self.kalshi_reader.get_fills(limit=50)
+        except Exception as e:
+            logger.debug(f"Failed to fetch fills for resting check: {e}")
+            return
+
+        # Group fills by order_id to aggregate partial fills
+        order_fills: dict[str, int] = {}
+        for fill in fills:
+            oid = fill.get("order_id", "")
+            if oid:
+                order_fills[oid] = order_fills.get(oid, 0) + fill.get("count", 0)
+
+        # Check each resting order tracked by the order manager
+        for order_id, order_info in list(self.order_manager._open_orders.items()):
+            if order_info.get("status") in ("filled", "canceled"):
+                continue
+
+            ticker = order_info["ticker"]
+            side = order_info["side"]
+            price = order_info["price"]
+
+            # Check if this order has fills in the API response
+            total_filled = order_fills.get(order_id, 0)
+            if total_filled <= 0:
+                continue
+
+            # Check if we already logged this specific order's fills
+            already_logged = order_info.get("logged_fills", 0)
+            new_fills = total_filled - already_logged
+            if new_fills <= 0:
+                continue
+
+            logger.info(
+                f"Late fill detected: {order_id} {side} {new_fills}x {ticker} @ {price}c"
+            )
+
+            # Get bracket info from order manager's tracked data
+            bracket_low = order_info.get("bracket_low", 0)
+            bracket_high = order_info.get("bracket_high", 0)
+            edge = order_info.get("edge", 0)
+
+            self.trade_logger.log_trade(
+                ticker, side, price, new_fills,
+                "ensemble", edge, 0, 0,
+                predicted_vol=order_info.get("predicted_vol"),
+                implied_vol=order_info.get("implied_vol"),
+                bracket_low=bracket_low, bracket_high=bracket_high,
+            )
+
+            try:
+                balance = self.kalshi.get_balance()
+            except Exception:
+                balance = 0
+
+            try:
+                send_trade_alert(
+                    ticker=ticker,
+                    side=side,
+                    price=price,
+                    size=new_fills,
+                    edge=edge,
+                    bracket_low=bracket_low,
+                    bracket_high=bracket_high,
+                    balance=balance,
+                    predicted_vol=order_info.get("predicted_vol"),
+                    implied_vol=order_info.get("implied_vol"),
+                )
+            except Exception as e:
+                logger.warning(f"Discord late fill alert failed: {e}")
+
+            # Track fills logged for this order to avoid double-counting
+            order_info["logged_fills"] = total_filled
+            if total_filled >= order_info.get("requested_count", total_filled):
+                self.order_manager.mark_filled(order_id)
 
     async def _settle_trades(self):
         """Check unresolved trades and settle.

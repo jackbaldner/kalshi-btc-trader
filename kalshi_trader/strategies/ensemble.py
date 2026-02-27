@@ -103,9 +103,9 @@ class EnsembleStrategy:
             result.ensemble_prob = bracket_prob
             result.edge = our_p - market_p
 
-            if result.edge > 0:
+            if result.edge >= self.edge_threshold:
                 result.side = "yes"
-            elif result.edge < -self.edge_threshold:
+            elif result.edge <= -self.edge_threshold:
                 result.side = "no"
                 result.edge = abs(result.edge)
                 our_p = 1 - bracket_prob

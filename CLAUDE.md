@@ -33,7 +33,7 @@ Kalshi (brackets, orderbook, WS) ──┘         │                    │
 - `fair_value.py` — FairValueModel: logistic regression, P(BTC up next 15m), heavy shrinkage (0.3x toward 50%)
 - `vol_model.py` — VolModel: gradient boosting, predicts next-candle absolute return magnitude
   - **Vol floor**: blended vol ≥ `vol_floor_ratio` × implied vol (default 0.5) — prevents phantom edge from systematic underestimation
-  - **Shrinkage**: fixed at 0.3 (optimization disabled — old version used wrong units). Will re-enable with real evaluation data
+  - **Shrinkage**: fixed at 0.4 (bumped from 0.3 based on 145-eval backtest — better win rate and PnL). Will re-enable optimization with more data
   - **Retraining**: every 6 hours on all available candles, with 3x shift safety check
 - `bracket_prob.py` — Converts directional prob + vol into bracket probability using normal CDF, with tail-risk adjustment
 - `kelly.py` — Kelly criterion sizing with ramp (0.25x at threshold → 1.0x at full_kelly_edge)
@@ -73,7 +73,7 @@ Kalshi (brackets, orderbook, WS) ──┘         │                    │
 - **Edge threshold**: 4% minimum to trade
 - **Kelly fraction**: 0.5 (half-Kelly for safety), ramps 0.25x→1.0x based on edge size
 - **Vol floor**: blended vol ≥ 50% of implied vol (`vol_floor_ratio` in config) — prevents phantom edge
-- **Model shrinkage**: Fair value 0.3x, vol model fixed 0.3 (optimization disabled, re-enable with real data)
+- **Model shrinkage**: Fair value 0.3x, vol model fixed 0.4 (bumped from 0.3 based on eval data)
 - **Output clipping**: Model probs clipped to [0.35, 0.65]
 - **Dedup**: max 1 eval per event close, 1 trade per ticker per hour, 3 per ticker per day
 - **Fill pricing**: walks opposite-side orderbook, prices 1c above best ask, verifies edge remains
