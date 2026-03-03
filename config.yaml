@@ -17,7 +17,7 @@ binance:
 strategy:
   edge_threshold: 0.04        # minimum edge to trade (4% — conservative for live)
   vol_model_lookback: 20       # candles for vol feature computation
-  kelly_fraction: 0.5         # half Kelly — safer for small bankroll
+  kelly_fraction: 0.75        # 3/4 Kelly — bumped from 0.5 based on strong 78% win rate
   full_kelly_edge: 0.10       # edge at which full Kelly kicks in (ramp from 0.25x at threshold)
   momentum_lookback: 4        # candles for momentum (all must agree)
   mean_reversion_threshold: 0.004  # 0.4% move threshold
@@ -35,7 +35,7 @@ strategy:
 risk:
   max_position_size: 50       # $ per trade — 10% of $500 bankroll
   max_total_exposure: 150     # $ total — 30% of bankroll across all positions
-  max_daily_loss: 50          # $ daily loss limit — 10% of bankroll
+  max_daily_loss: 150         # $ daily loss limit — matches max exposure
   max_daily_trades_per_bracket: 3  # max trades per ticker per day to avoid overconcentration
   cancel_before_expiry_sec: 15   # cancel open orders 15s before expiry (gives ~100s to fill)
 
