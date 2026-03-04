@@ -36,6 +36,7 @@ risk:
   max_position_size: 50       # $ per trade — 10% of $500 bankroll
   max_total_exposure: 150     # $ total — 30% of bankroll across all positions
   max_daily_loss: 150         # $ daily loss limit — matches max exposure
+  max_no_price_cents: 65       # don't buy NOs above 65c (bad risk/reward)
   max_daily_trades_per_bracket: 3  # max trades per ticker per day to avoid overconcentration
   cancel_before_expiry_sec: 15   # cancel open orders 15s before expiry (gives ~100s to fill)
 

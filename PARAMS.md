@@ -4,6 +4,7 @@ Quick reference for every parameter change, when it happened, and why.
 
 | Date | Parameter | From | To | Why | Result |
 |------|-----------|------|----|-----|--------|
+| 2026-03-03 | `risk.max_no_price_cents` | 50 | 65 | 79 trades blocked in 51-65c range — bot going quiet for hours with real edge (8-18%) being left on the table | — |
 | 2026-03-03 | `risk.max_daily_loss` | $50 | $150 | With Kelly at 0.75, positions are bigger — 2 bad NO trades ($33 each) were blowing through $50 and shutting down the bot for the rest of the day | — |
 | 2026-03-02 | `kelly.fraction` | 0.5 | 0.75 | 78% win rate across 968 evals, NO side consistently 69-82%. Hard risk limits ($50/trade, $150 exposure) still cap downside | — |
 | 2026-02-27 | `ensemble.py` bracket edge check | `> 0` (yes), `< -threshold` (no) | `>= threshold` (yes), `<= -threshold` (no) | Asymmetric check let tiny positive edges through (caught by safety net but wasted compute) | Cleaner, symmetric threshold check |
