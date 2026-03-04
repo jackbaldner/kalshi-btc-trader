@@ -1,7 +1,7 @@
 .env
 *.pem
 keys/
-data/
+/data/
 __pycache__/
 *.pyc
 .venv/
